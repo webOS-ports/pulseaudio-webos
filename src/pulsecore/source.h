@@ -218,6 +218,12 @@ struct pa_source {
      * thread. */
     int (*set_port)(pa_source *s, pa_device_port *port); /*ditto */
 
+#ifdef HAVE_PALM_RESAMPLER
+    /* Called when requesting update to sample specifications. Called from IO
+     * thread context. */
+    void (*update_sample_spec)(pa_source *s, pa_sample_spec *sample_spec); /* dito */
+#endif
+
     /* Called to get the list of formats supported by the source, sorted
      * in descending order of preference. */
     pa_idxset* (*get_formats)(pa_source *s); /* ditto */

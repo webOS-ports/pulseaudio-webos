@@ -28,6 +28,23 @@
 #include <pulsecore/remap.h>
 #include <pulsecore/filter/lfe-filter.h>
 
+#ifdef HAVE_PALM_RESAMPLER
+#include "palm/palm-resampler.h"
+#endif
+
+struct peaks_data { /* data specific to the peak finder pseudo resampler */
+    unsigned o_counter;
+    unsigned i_counter;
+
+    float max_f[PA_CHANNELS_MAX];
+    int16_t max_i[PA_CHANNELS_MAX];
+};
+
+struct trivial_data { /* data specific to the trivial resampler */
+    unsigned o_counter;
+    unsigned i_counter;
+};
+
 typedef struct pa_resampler pa_resampler;
 typedef struct pa_resampler_impl pa_resampler_impl;
 
@@ -57,6 +74,9 @@ typedef enum pa_resample_method {
     PA_RESAMPLER_FFMPEG,
     PA_RESAMPLER_AUTO, /* automatic select based on sample format */
     PA_RESAMPLER_COPY,
+#ifdef HAVE_PALM_RESAMPLER
+    PA_RESAMPLER_PALM,
+#endif
     PA_RESAMPLER_PEAKS,
     PA_RESAMPLER_SOXR_MQ,
     PA_RESAMPLER_SOXR_HQ,
@@ -111,6 +131,12 @@ struct pa_resampler {
     pa_lfe_filter_t *lfe_filter;
 
     pa_resampler_impl impl;
+#ifdef HAVE_PALM_RESAMPLER
+    struct { /* data specific to palm */
+        palm_resampler *state;
+    }palm;
+#endif
+
 };
 
 pa_resampler* pa_resampler_new(

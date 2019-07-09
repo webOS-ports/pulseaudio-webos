@@ -52,6 +52,10 @@
 #undef PA_BIND_NOW
 #endif
 
+#ifdef HAVE_PALM_RESAMPLER
+#undef PA_BIND_NOW
+#endif
+
 #ifdef PA_BIND_NOW
 
 /*

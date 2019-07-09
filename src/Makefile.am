@@ -31,6 +31,10 @@ if HAVE_ALSA
 alsaprofilesetsdir=$(datadir)/pulseaudio/alsa-mixer/profile-sets
 alsapathsdir=$(datadir)/pulseaudio/alsa-mixer/paths
 endif
+if HAVE_PALM_RESAMPLER
+pulseaudio_LDADD += libpalm-resampler.la
+pulseaudio_DEPENDENCIES += libpalm-resampler.la
+endif
 if HAVE_DBUS
 dbuspolicydir=$(sysconfdir)/dbus-1/system.d
 endif
@@ -943,6 +947,14 @@ libpulsedsp_la_CFLAGS = $(AM_CFLAGS)
 libpulsedsp_la_LIBADD = $(AM_LIBADD) libpulse.la libpulsecommon-@PA_MAJORMINOR@.la
 libpulsedsp_la_LDFLAGS = $(AM_LDFLAGS) $(AM_LIBLDFLAGS) -avoid-version -disable-static
 
+if HAVE_PALM_RESAMPLER
+noinst_LTLIBRARIES  += libpalm-resampler.la
+libpalm_resampler_la_SOURCES = pulsecore/palm/palm-resampler.c pulsecore/palm/palm-resampler.h
+libpalm_resampler_la_CFLAGS = $(AM_CFLAGS) $(PALM_CFLAGS)
+libpalm_resampler_la_LIBADD = $(AM_LIBADD) libpulse.la libpulsecommon-@PA_MAJORMINOR@.la
+libpalm_resampler_la_LDFLAGS = $(AM_LDFLAGS) $(VERSIONING_LDFLAGS) -version-info $(LIBPULSE_MAINLOOP_GLIB_VERSION_INFO)
+endif
+
 ###################################
 #      Daemon core library        #
 ###################################
@@ -1007,6 +1019,10 @@ libpulsecore_@PA_MAJORMINOR@_la_SOURCES = \
 libpulsecore_@PA_MAJORMINOR@_la_CFLAGS = $(AM_CFLAGS) $(SERVER_CFLAGS) $(LIBSNDFILE_CFLAGS) $(WINSOCK_CFLAGS)
 libpulsecore_@PA_MAJORMINOR@_la_LDFLAGS = $(AM_LDFLAGS) $(AM_LIBLDFLAGS) -avoid-version
 libpulsecore_@PA_MAJORMINOR@_la_LIBADD = $(AM_LIBADD) $(LIBLTDL) $(LIBSNDFILE_LIBS) $(WINSOCK_LIBS) $(LTLIBICONV) libpulsecommon-@PA_MAJORMINOR@.la libpulse.la libpulsecore-foreign.la
+
+if HAVE_PALM_RESAMPLER
+libpulsecore_@PA_MAJORMINOR@_la_LIBADD += libpalm-resampler.la
+endif
 
 if HAVE_NEON
 noinst_LTLIBRARIES += libpulsecore_sconv_neon.la libpulsecore_mix_neon.la libpulsecore_remap_neon.la

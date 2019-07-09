@@ -25,10 +25,12 @@
 
 #include <pulsecore/resampler.h>
 
+#ifndef HAVE_PALM_RESAMPLER
 struct trivial_data { /* data specific to the trivial resampler */
     unsigned o_counter;
     unsigned i_counter;
 };
+#endif
 
 static unsigned trivial_resample(pa_resampler *r, const pa_memchunk *input, unsigned in_n_frames, pa_memchunk *output, unsigned *out_n_frames) {
     unsigned i_index, o_index;

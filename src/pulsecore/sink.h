@@ -254,6 +254,12 @@ struct pa_sink {
      * thread. */
     int (*set_port)(pa_sink *s, pa_device_port *port); /* may be NULL */
 
+#ifdef HAVE_PALM_RESAMPLER
+    /* Called when requesting update to sample specifications. Called from IO
+     * thread context. */
+    void (*update_sample_spec)(pa_sink *s, pa_sample_spec *sample_spec); /* dito */
+#endif
+
     /* Called to get the list of formats supported by the sink, sorted
      * in descending order of preference. */
     pa_idxset* (*get_formats)(pa_sink *s); /* may be NULL */

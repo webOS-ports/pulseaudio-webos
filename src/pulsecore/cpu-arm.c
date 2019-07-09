@@ -94,10 +94,17 @@ void pa_cpu_get_arm_flags(pa_cpu_arm_flag_t *flags) {
     /* get the CPU architecture */
     if ((line = get_cpuinfo_line(cpuinfo, "CPU architecture"))) {
         arch = strtoul(line, NULL, 0);
+#ifdef HAVE_PALM_RESAMPLER
+        if (arch >= 7)
+            *flags |= PA_CPU_ARM_V7;
+        else if (6 == arch)
+            *flags |= PA_CPU_ARM_V6;
+#else
         if (arch >= 6)
             *flags |= PA_CPU_ARM_V6;
         if (arch >= 7)
             *flags |= PA_CPU_ARM_V7;
+#endif
 
         pa_xfree(line);
     }

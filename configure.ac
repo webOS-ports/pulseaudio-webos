@@ -843,6 +843,17 @@ AM_CONDITIONAL([HAVE_ALSA], [test "x$HAVE_ALSA" = x1])
 AS_IF([test "x$HAVE_ALSA" = "x1"], AC_DEFINE([HAVE_ALSA], 1, [Have ALSA?]))
 AS_IF([test "x$HAVE_ALSA_UCM" = "x1"], AC_DEFINE([HAVE_ALSA_UCM], 1, [Have ALSA UCM?]))
 
+### palm resampler ####
+
+AC_ARG_ENABLE([palm-resampler],
+    AS_HELP_STRING([--enable-palm-resampler], [Enable palm resampler support]))
+
+AS_IF([test "x$enable_palm_resampler" = "xyes"], HAVE_PALM_RESAMPLER=1, HAVE_PALM_RESAMPLER=0)
+
+AC_SUBST(HAVE_PALM_RESAMPLER)
+AM_CONDITIONAL([HAVE_PALM_RESAMPLER], [test "x$HAVE_PALM_RESAMPLER" = x1])
+AS_IF([test "x$HAVE_PALM_RESAMPLER" = "x1"], AC_DEFINE([HAVE_PALM_RESAMPLER], 1, [Have PALM_RESAMPLER?]))
+
 #### EsounD support (optional) ####
 
 AC_ARG_ENABLE([esound],

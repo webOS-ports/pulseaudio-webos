@@ -39,6 +39,10 @@
 #include <pulsecore/pipe.h>
 #endif
 
+#ifdef HAVE_PALM_RESAMPLER
+#undef HAVE_SYS_EVENTED_H
+#endif
+
 #ifdef HAVE_SYS_EVENTFD_H
 #include <sys/eventfd.h>
 #endif
