@@ -250,8 +250,16 @@ if test "x$enable_atomic_arm_memory_barrier" = "xyes"; then
     AC_DEFINE_UNQUOTED(ATOMIC_ARM_MEMORY_BARRIER_ENABLED, 1, [Enable memory barriers])
 fi
 
+AC_ARG_ENABLE([libatomic-ops],
+    AS_HELP_STRING([--disable-libatomic-ops],[force disable usage of libatomic_ops]))
+
 # If everything else fails use libatomic_ops
 need_libatomic_ops=yes
+
+if test "x$enable_libatomic_ops" = "xno" ; then
+    AC_MSG_NOTICE([usage of libatomic_ops disabled])
+    need_libatomic_ops=no
+fi
 
 AC_CACHE_CHECK([whether $CC knows __sync_bool_compare_and_swap()],
     pulseaudio_cv_sync_bool_compare_and_swap, [
