@@ -862,6 +862,17 @@ AC_SUBST(HAVE_PALM_RESAMPLER)
 AM_CONDITIONAL([HAVE_PALM_RESAMPLER], [test "x$HAVE_PALM_RESAMPLER" = x1])
 AS_IF([test "x$HAVE_PALM_RESAMPLER" = "x1"], AC_DEFINE([HAVE_PALM_RESAMPLER], 1, [Have PALM_RESAMPLER?]))
 
+### palm policy ####
+
+AC_ARG_ENABLE([palm-policy],
+    AS_HELP_STRING([--enable-palm-policy], [Enable palm policy support]))
+
+AS_IF([test "x$enable_palm_policy" = "xyes"], HAVE_PALM_POLICY=1, HAVE_PALM_POLICY=0)
+
+AC_SUBST(HAVE_PALM_POLICY)
+AM_CONDITIONAL([HAVE_PALM_POLICY], [test "x$HAVE_PALM_POLICY" = x1])
+AS_IF([test "x$HAVE_PALM_POLICY" = "x1"], AC_DEFINE([HAVE_PALM_POLICY], 1, [Have PALM_POLICY?]))
+
 ### raspberrypi ####
 
 AC_ARG_ENABLE([rpi],

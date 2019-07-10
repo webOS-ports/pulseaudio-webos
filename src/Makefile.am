@@ -1511,6 +1511,11 @@ bin_SCRIPTS += utils/qpaeq
 endif
 endif
 
+if HAVE_PALM_POLICY
+modlibexec_LTLIBRARIES += \
+		module-palm-policy.la
+endif
+
 # Simple protocol
 
 module_simple_protocol_tcp_la_SOURCES = modules/module-protocol-stub.c
@@ -2177,6 +2182,13 @@ module_bluez5_device_la_SOURCES = modules/bluetooth/module-bluez5-device.c
 module_bluez5_device_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_bluez5_device_la_LIBADD = $(MODULE_LIBADD) $(SBC_LIBS) libbluez5-util.la
 module_bluez5_device_la_CFLAGS = $(AM_CFLAGS) $(SBC_CFLAGS) -DPA_MODULE_NAME=module_bluez5_device
+
+if HAVE_PALM_POLICY
+module_palm_policy_la_SOURCES = modules/module-palm-policy.c
+module_palm_policy_la_LDFLAGS = $(MODULE_LDFLAGS)
+module_palm_policy_la_LIBADD = $(AM_LIBADD) libpulsecore-@PA_MAJORMINOR@.la libpulsecommon-@PA_MAJORMINOR@.la libpulse.la -lasound
+module_palm_policy_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_palm_policy
+endif 
 
 # Apple Airtunes/RAOP
 module_raop_sink_la_SOURCES = modules/raop/module-raop-sink.c
