@@ -23,9 +23,7 @@
  * as determined by audioD.
  **********************************************************************/
 
-#if defined(__i386__) && defined(LOCAL_TEST_BUILD)
-#include <pulsecore/config.h> /* bit of a hack, this, I have a local copy of config.h for x86 in the /usr/include/pulsecore/ dir */
-#else
+#ifdef HAVE_CONFIG_H
 #include <config.h>
 #endif
 
@@ -57,6 +55,14 @@
 #include "module-palm-policy.h"
 #include "module-palm-policy-tables.h"
 #include "module-palm-policy-util.h"
+
+/* Upstream PulseAudio has no such proplist key -- it is an LG addition carried in
+ * this fork's own src/pulse/proplist.h. Define it locally so the module can be
+ * built out-of-tree against an unmodified PulseAudio. Only this module reads and
+ * writes the key, so a local definition is sufficient. */
+#ifndef PA_PROP_PREFERRED_DEVICE
+#define PA_PROP_PREFERRED_DEVICE "preferred.device"
+#endif
 
 #define _MEM_ZERO(object) (memset(&(object), '\0', sizeof((object))))
 #define _NAME_STRUCT_OFFSET(struct_type, member) ((long)((unsigned char *)&((struct_type *)0)->member))
@@ -124,9 +130,9 @@ struct sinkinputnode
                                * _enum_virtualsinkmap rather than a pulseaudio sink idx */
     pa_sink_input *sinkinput; /* reference to sink input with this index */
 
-    pa_bool_t paused;
+    bool paused;
 
-    pa_bool_t bypassRouting;
+    bool bypassRouting;
 
     char appname[APP_NAME_LENGTH];
 
@@ -139,9 +145,9 @@ struct sourceoutputnode
     int32_t virtualsourceid;        /* index of virtual sink it was created against, this is our index from
                                      * _enum_virtualsourcemap rather than a pulseaudio sink idx */
     pa_source_output *sourceoutput; /* reference to sink input with this index */
-    pa_bool_t paused;
+    bool paused;
 
-    pa_bool_t bypassRouting;
+    bool bypassRouting;
 
     char appname[APP_NAME_LENGTH];
 
@@ -214,7 +220,7 @@ struct userdata
     struct sockaddr_un name;    /* filename for socket */
     pa_io_event *sockev;        /* socket event handler */
     pa_io_event *connev;        /* connection event handler */
-    pa_bool_t connectionactive; /* do we have an active connection on the socket */
+    bool connectionactive; /* do we have an active connection on the socket */
 
     // Maintain count of sinks opened, as sent to audiod, so that we can re-send data on reconnect for audiod to resync with us
     int32_t audiod_sink_input_opened[eVirtualSink_Count];
@@ -367,7 +373,7 @@ static pa_hook_result_t route_source_output_unlink_hook_callback(pa_core *c, pa_
 static pa_hook_result_t route_sink_state_changed_hook_callback(pa_core *c, pa_object *o,
                                                                struct userdata *u);
 
-static pa_bool_t sink_input_new_data_is_passthrough(pa_sink_input_new_data *data);
+static bool sink_input_new_data_is_passthrough(pa_sink_input_new_data *data);
 
 static pa_hook_result_t sink_state_changed_cb(pa_core *c, pa_object *o, struct userdata *u);
 
@@ -389,7 +395,7 @@ bool detect_usb_device(struct userdata *u, bool isOutput, int cardNumber, int de
 
 PA_MODULE_AUTHOR("Palm, Inc.");
 PA_MODULE_DESCRIPTION("Implements policy, communication with external app is a socket at /tmp/palmaudio");
-PA_MODULE_VERSION(PACKAGE_VERSION);
+PA_MODULE_VERSION(PULSEAUDIO_VERSION);
 PA_MODULE_LOAD_ONCE(true);
 PA_MODULE_USAGE("No parameters for this module");
 
@@ -817,7 +823,7 @@ void check_and_remove_usb_device_module(struct userdata *u, bool isOutput, pa_mo
 Once it is removed, audio will be routed to HDMI.
 */
 
-static pa_bool_t sink_input_new_data_is_passthrough(pa_sink_input_new_data *data)
+static bool sink_input_new_data_is_passthrough(pa_sink_input_new_data *data)
 {
 
     if (pa_sink_input_new_data_is_passthrough(data))

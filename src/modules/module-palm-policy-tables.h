@@ -17,7 +17,9 @@
   along with PulseAudio; if not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#ifdef HAVE_CONFIG_H
 #include <config.h>
+#endif
 
 #ifdef MACHINE_IS_SIRLOIN
     #include "module-palm-policy-tables-sirloin.h"
