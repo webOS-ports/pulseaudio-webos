@@ -971,7 +971,8 @@ static bool set_source_inputdevice(struct userdata *u, char *inputdevice, int so
             return false;
         }
         /* walk the list of siource-inputs we know about and update their sources */
-        for (thelistitem = u->sourceoutputnodelist; thelistitem != NULL; thelistitem = thelistitem->next)
+        struct sourceoutputnode *thelistitem_next;
+        PA_LLIST_FOREACH_SAFE(thelistitem, thelistitem_next, u->sourceoutputnodelist)
         {
             if ((int)thelistitem->virtualsourceid == sourceId && !pa_source_output_is_passthrough(thelistitem->sourceoutput))
             {
@@ -1005,7 +1006,8 @@ static bool set_sink_outputdevice(struct userdata *u, char *outputdevice, int si
             return false;
         }
         /* walk the list of sink-inputs we know about and update their sinks */
-        for (thelistitem = u->sinkinputnodelist; thelistitem != NULL; thelistitem = thelistitem->next)
+        struct sinkinputnode *thelistitem_next;
+        PA_LLIST_FOREACH_SAFE(thelistitem, thelistitem_next, u->sinkinputnodelist)
         {
             if ((int)thelistitem->virtualsinkid == sinkid && !pa_sink_input_is_passthrough(thelistitem->sinkinput))
             {
@@ -1038,7 +1040,8 @@ static bool set_sink_outputdevice_on_range(struct userdata *u, char *outputdevic
                 return false;
             }
             /* walk the list of sink-inputs we know about and update their sinks */
-            for (thelistitem = u->sinkinputnodelist; thelistitem != NULL; thelistitem = thelistitem->next)
+            struct sinkinputnode *thelistitem_next;
+            PA_LLIST_FOREACH_SAFE(thelistitem, thelistitem_next, u->sinkinputnodelist)
             {
                 if ((int)thelistitem->virtualsinkid == i && !pa_sink_input_is_passthrough(thelistitem->sinkinput) && !(thelistitem->bypassRouting))
                 {
@@ -1072,7 +1075,8 @@ static bool set_source_inputdevice_on_range(struct userdata *u, char *inputdevic
                 return false;
             }
             /* walk the list of siource-inputs we know about and update their sources */
-            for (thelistitem = u->sourceoutputnodelist; thelistitem != NULL; thelistitem = thelistitem->next)
+            struct sourceoutputnode *thelistitem_next;
+            PA_LLIST_FOREACH_SAFE(thelistitem, thelistitem_next, u->sourceoutputnodelist)
             {
                 if ((int)thelistitem->virtualsourceid == i && !pa_source_output_is_passthrough(thelistitem->sourceoutput) && !(thelistitem->bypassRouting))
                 {
@@ -1105,7 +1109,8 @@ static bool set_default_sink_routing(struct userdata *u, int startsinkid, int en
                 continue;
             }
             /* walk the list of sink-inputs we know about and update their sinks */
-            for (thelistitem = u->sinkinputnodelist; thelistitem != NULL; thelistitem = thelistitem->next)
+            struct sinkinputnode *thelistitem_next;
+            PA_LLIST_FOREACH_SAFE(thelistitem, thelistitem_next, u->sinkinputnodelist)
             {
                 if ((int)thelistitem->virtualsinkid == i && !pa_sink_input_is_passthrough(thelistitem->sinkinput))
                 {
@@ -1138,7 +1143,8 @@ static bool set_default_source_routing(struct userdata *u, int startsourceid, in
                 continue;
             }
             /* walk the list of siource-inputs we know about and update their sources */
-            for (thelistitem = u->sourceoutputnodelist; thelistitem != NULL; thelistitem = thelistitem->next)
+            struct sourceoutputnode *thelistitem_next;
+            PA_LLIST_FOREACH_SAFE(thelistitem, thelistitem_next, u->sourceoutputnodelist)
             {
                 if ((int)thelistitem->virtualsourceid == i && !pa_source_output_is_passthrough(thelistitem->sourceoutput))
                 {
@@ -1172,7 +1178,8 @@ static bool virtual_source_output_move_inputdevice(int virtualsourceid, char *in
         }
 
         /* walk the list of source-inputs we know about and update their sources */
-        for (thelistitem = u->sourceoutputnodelist; thelistitem != NULL; thelistitem = thelistitem->next)
+        struct sourceoutputnode *thelistitem_next;
+        PA_LLIST_FOREACH_SAFE(thelistitem, thelistitem_next, u->sourceoutputnodelist)
         {
             if (thelistitem->virtualsourceid == virtualsourceid)
             {
@@ -1226,7 +1233,8 @@ static bool virtual_sink_input_move_outputdevice(int virtualsinkid, char *output
             return false;
         }
         /* walk the list of sink-inputs we know about and update their sinks */
-        for (thelistitem = u->sinkinputnodelist; thelistitem != NULL; thelistitem = thelistitem->next)
+        struct sinkinputnode *thelistitem_next;
+        PA_LLIST_FOREACH_SAFE(thelistitem, thelistitem_next, u->sinkinputnodelist)
         {
             if ((int)thelistitem->virtualsinkid == virtualsinkid && !pa_sink_input_is_passthrough(thelistitem->sinkinput))
             {
@@ -1343,14 +1351,21 @@ static bool virtual_sink_input_set_volume(int sinkid, int volumetoset, int volum
 static bool close_playback_by_sink_input(int sinkInputIndex, struct userdata *u)
 {
     struct sinkinputnode *thelistitem = NULL;
+    pa_client *client = NULL;
     pa_log_info("close_playback_by_sink_input close client associated with sinkinput index %d", sinkInputIndex);
     for (thelistitem = u->sinkinputnodelist; thelistitem != NULL; thelistitem = thelistitem->next)
     {
         if (thelistitem->sinkinputidx == sinkInputIndex)
         {
-            pa_client_kill(thelistitem->sinkinput->client);
+            client = thelistitem->sinkinput->client;
+            break;
         }
     }
+    /* Kill outside the walk: pa_client_kill() unlinks the client's streams
+     * there and then, and route_sink_input_unlink_hook_callback() frees their
+     * nodes - the one the loop would have read ->next from among them. */
+    if (client)
+        pa_client_kill(client);
     return true;
 }
 
@@ -2049,7 +2064,9 @@ static bool set_audio_effect(struct userdata *u, const char* effect, int enabled
 
         destsink = pa_namereg_get(u->core, "preprocess_sink", PA_NAMEREG_SINK);
 
-        for (thelistitem = u->sinkinputnodelist; thelistitem != NULL; thelistitem = thelistitem->next) {
+        struct sinkinputnode *thelistitem_next;
+
+        PA_LLIST_FOREACH_SAFE(thelistitem, thelistitem_next, u->sinkinputnodelist) {
             const char *media_name = pa_proplist_gets(thelistitem->sinkinput->proplist, "media.name");
             if ((media_name) && (strcmp(media_name, "preprocess Stream") == 0)) {
                 thelistitem->sinkinput->origin_sink = NULL;
@@ -2077,7 +2094,9 @@ static bool set_audio_effect(struct userdata *u, const char* effect, int enabled
 
         destsource = pa_namereg_get(u->core, "preprocess-source", PA_NAMEREG_SOURCE);
 
-        for (item = u->sourceoutputnodelist; item != NULL; item = item->next) {
+        struct sourceoutputnode *item_next;
+
+        PA_LLIST_FOREACH_SAFE(item, item_next, u->sourceoutputnodelist) {
             const char *media_name = pa_proplist_gets(item->sourceoutput->proplist, "media.name");
             if ((media_name) && (strcmp(media_name, "preprocess Stream") == 0)) {
                 item->sourceoutput->destination_source = NULL;
@@ -2132,7 +2151,8 @@ static bool set_audio_effect(struct userdata *u, const char* effect, int enabled
 
             destsource = pa_namereg_get(u->core, u->source_mapping_table[sourceId].inputdevice, PA_NAMEREG_SOURCE);
 
-            for (item = u->sourceoutputnodelist; item != NULL; item = item->next)
+            struct sourceoutputnode *item_next;
+            PA_LLIST_FOREACH_SAFE(item, item_next, u->sourceoutputnodelist)
             {
                 const char *media_name = pa_proplist_gets(item->sourceoutput->proplist, "media.name");
                 if ((media_name) && (strcmp(media_name, "preprocess Stream") == 0))
@@ -3103,6 +3123,28 @@ static void disconnect_hooks(struct userdata *u)
 
     if (u->sink_unlink)
         pa_hook_slot_free(u->sink_unlink);
+
+    /* These were connected in pa__init() but never let go of: once the
+     * module was unloaded, the next module, sink or source to come or go -
+     * at shutdown, every one unloaded after this module - called back into
+     * the freed userdata. */
+    if (u->sink_unlink_post)
+        pa_hook_slot_free(u->sink_unlink_post);
+
+    if (u->source_unlink_post)
+        pa_hook_slot_free(u->source_unlink_post);
+
+    if (u->module_load_hook_slot)
+        pa_hook_slot_free(u->module_load_hook_slot);
+
+    if (u->module_unload_hook_slot)
+        pa_hook_slot_free(u->module_unload_hook_slot);
+
+    if (u->sink_load_hook_slot)
+        pa_hook_slot_free(u->sink_load_hook_slot);
+
+    if (u->source_load_hook_slot)
+        pa_hook_slot_free(u->source_load_hook_slot);
 }
 
 /* entry point for the module*/

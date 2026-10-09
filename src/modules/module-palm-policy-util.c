@@ -47,6 +47,10 @@ pa_palm_policy* pa_palm_policy_get(pa_core *c) {
     pa_palm_policy *pp;
     unsigned i;
 
+    /* one per core, shared with whoever else asks for it */
+    if ((pp = pa_shared_get(c, "palm-policy")))
+        return pa_palm_policy_ref(pp);
+
     pp = pa_xnew0(pa_palm_policy, 1);
     PA_REFCNT_INIT(pp);
     pp->core = c;
@@ -75,6 +79,8 @@ void pa_palm_policy_unref(pa_palm_policy *pp) {
         return;
 
     pa_shared_remove(pp->core, "palm-policy");
+    for (unsigned i = 0; i < PA_PALM_POLICY_HOOK_MAX; i++)
+        pa_hook_done(&pp->hooks[i]);
     pa_xfree(pp);
 }
 
