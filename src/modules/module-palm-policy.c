@@ -250,7 +250,7 @@ struct userdata
     int connectionPort;
     char *connectionType;
     char *deviceName;
-    char *callback_deviceName;
+    const char *callback_deviceName;
 
     int external_soundcard_number;
     int external_device_number;
@@ -329,6 +329,15 @@ static bool send_to_audiod(struct userdata *u, uint32_t msgType, uint32_t msgID,
         return false;
     }
     return true;
+}
+
+/* Copy a string into a fixed-size field: always terminated, truncated if it
+ * has to be, and a missing string copies as an empty one. */
+static void copy_field(char *dst, size_t size, const char *src)
+{
+    pa_assert(dst);
+    pa_assert(size > 0);
+    pa_strlcpy(dst, src ? src : "", size);
 }
 
 /* _mapPercentToPulseRamp is indexed by a volume table and a volume in
@@ -588,7 +597,7 @@ bool init_multiple_usb_device_info(struct userdata *u, bool isOutput, int maxDev
     mdi->deviceList = pa_xnew0(deviceInfo, mdi->maxDeviceCount);
 
     // initialize member variable
-    strncpy(mdi->baseName, baseName, strlen(baseName));
+    memcpy(mdi->baseName, baseName, (size_t)baseNameSize);
     for (int i = 0; i < mdi->maxDeviceCount; i++)
     {
         deviceInfo *deviceList = (mdi->deviceList + i);
@@ -834,7 +843,7 @@ void find_and_load_usb_devices(struct userdata *u, char *deviceName, snd_pcm_str
     while (card >= 0)
     {
         char name[32];
-        sprintf(name, "hw:%d", card);
+        snprintf(name, sizeof(name), "hw:%d", card);
         if ((err = snd_ctl_open(&handle, name, 0)) < 0)
         {
             pa_log_warn("control open (%i): %s", card, snd_strerror(err));
@@ -960,7 +969,7 @@ static bool set_source_inputdevice(struct userdata *u, char *inputdevice, int so
     struct sourceoutputnode *thelistitem = NULL;
     if (sourceId >= 0 && sourceId < eVirtualSource_Count)
     {
-        strncpy(u->source_mapping_table[sourceId].inputdevice, inputdevice, DEVICE_NAME_LENGTH);
+        copy_field(u->source_mapping_table[sourceId].inputdevice, sizeof(u->source_mapping_table[sourceId].inputdevice), inputdevice);
         pa_log_info("set_source_inputdevice setting inputdevice:%s for source:%s",
                     u->source_mapping_table[sourceId].inputdevice, u->source_mapping_table[sourceId].virtualsourcename);
         destsource =
@@ -990,7 +999,7 @@ static bool set_sink_outputdevice(struct userdata *u, char *outputdevice, int si
     struct sinkinputnode *thelistitem = NULL;
     if (sinkid >= 0 && sinkid < eVirtualSink_Count)
     {
-        strncpy(u->sink_mapping_table[sinkid].outputdevice, outputdevice, DEVICE_NAME_LENGTH);
+        copy_field(u->sink_mapping_table[sinkid].outputdevice, sizeof(u->sink_mapping_table[sinkid].outputdevice), outputdevice);
         pa_log_info("set_sink_outputdevice setting outputdevice:%s for sink:%s",
                     u->sink_mapping_table[sinkid].outputdevice, u->sink_mapping_table[sinkid].virtualsinkname);
         destsink =
@@ -1022,7 +1031,7 @@ static bool set_sink_outputdevice_on_range(struct userdata *u, char *outputdevic
     {
         for (int i = startsinkid; i <= endsinkid; i++)
         {
-            strncpy(u->sink_mapping_table[i].outputdevice, outputdevice, DEVICE_NAME_LENGTH);
+            copy_field(u->sink_mapping_table[i].outputdevice, sizeof(u->sink_mapping_table[i].outputdevice), outputdevice);
             destsink = pa_namereg_get(u->core, u->sink_mapping_table[i].outputdevice, PA_NAMEREG_SINK);
 
             if (destsink == NULL)
@@ -1056,7 +1065,7 @@ static bool set_source_inputdevice_on_range(struct userdata *u, char *inputdevic
     {
         for (int i = startsourceid; i <= endsourceid; i++)
         {
-            strncpy(u->source_mapping_table[i].inputdevice, inputdevice, DEVICE_NAME_LENGTH);
+            copy_field(u->source_mapping_table[i].inputdevice, sizeof(u->source_mapping_table[i].inputdevice), inputdevice);
             destsource =
                 pa_namereg_get(u->core, u->source_mapping_table[i].inputdevice, PA_NAMEREG_SOURCE);
             if (destsource == NULL)
@@ -1089,7 +1098,7 @@ static bool set_default_sink_routing(struct userdata *u, int startsinkid, int en
     {
         for (int i = startsinkid; i <= endsinkid; i++)
         {
-            strncpy(u->sink_mapping_table[i].outputdevice, u->sink_mapping_table[i].virtualsinkname, DEVICE_NAME_LENGTH);
+            copy_field(u->sink_mapping_table[i].outputdevice, sizeof(u->sink_mapping_table[i].outputdevice), u->sink_mapping_table[i].virtualsinkname);
             destsink =
                 pa_namereg_get(u->core, u->sink_mapping_table[i].outputdevice, PA_NAMEREG_SINK);
             if (destsink == NULL)
@@ -1119,7 +1128,7 @@ static bool set_default_source_routing(struct userdata *u, int startsourceid, in
     {
         for (int i = startsourceid; i <= endsourceid; i++)
         {
-            strncpy(u->source_mapping_table[i].inputdevice, u->source_mapping_table[i].virtualsourcename, DEVICE_NAME_LENGTH);
+            copy_field(u->source_mapping_table[i].inputdevice, sizeof(u->source_mapping_table[i].inputdevice), u->source_mapping_table[i].virtualsourcename);
             destsource =
                 pa_namereg_get(u->core, u->source_mapping_table[i].inputdevice, PA_NAMEREG_SOURCE);
             if (destsource == NULL)
@@ -1148,7 +1157,7 @@ static bool virtual_source_output_move_inputdevice(int virtualsourceid, char *in
     pa_source *destsource = NULL;
     if (virtualsourceid >= 0 && virtualsourceid < eVirtualSource_Count)
     {
-        strncpy(u->source_mapping_table[virtualsourceid].inputdevice, inputdevice, DEVICE_NAME_LENGTH);
+        copy_field(u->source_mapping_table[virtualsourceid].inputdevice, sizeof(u->source_mapping_table[virtualsourceid].inputdevice), inputdevice);
         pa_log_info("virtual_source_output_move_inputdevice name = %s", u->source_mapping_table[virtualsourceid].inputdevice);
         destsource =
             pa_namereg_get(u->core, u->source_mapping_table[virtualsourceid].inputdevice, PA_NAMEREG_SOURCE);
@@ -1198,7 +1207,7 @@ static bool virtual_sink_input_move_outputdevice(int virtualsinkid, char *output
     pa_sink *destsink = NULL;
     if (virtualsinkid >= 0 && virtualsinkid < eVirtualSink_Count)
     {
-        strncpy(u->sink_mapping_table[virtualsinkid].outputdevice, outputdevice, DEVICE_NAME_LENGTH);
+        copy_field(u->sink_mapping_table[virtualsinkid].outputdevice, sizeof(u->sink_mapping_table[virtualsinkid].outputdevice), outputdevice);
         pa_log_info("virtual_sink_input_move_outputdevice name = %s", u->sink_mapping_table[virtualsinkid].outputdevice);
         destsink =
             pa_namereg_get(u->core, u->sink_mapping_table[virtualsinkid].outputdevice, PA_NAMEREG_SINK);
@@ -1899,8 +1908,6 @@ static bool load_Bluetooth_module(struct userdata *u)
         char btSinkInit[BLUETOOTH_SINK_INIT_SIZE] = "bluez_sink.";
         btSinkInit[BLUETOOTH_SINK_INIT_SIZE - 1] = '\0';
 
-        memset(physicalSinkBT, '\0', sizeof(physicalSinkBT));
-        strncpy(physicalSinkBT, btSinkInit, sizeof(btSinkInit) - 1);
         int index = 0;
         while (u->address[index] != '\0')
         {
@@ -1910,13 +1917,13 @@ static bool load_Bluetooth_module(struct userdata *u)
             }
             index++;
         }
-        strncat(physicalSinkBT, u->address, BLUETOOTH_MAC_ADDRESS_SIZE);
+        snprintf(physicalSinkBT, sizeof(physicalSinkBT), "%s%s", btSinkInit, u->address);
         for (size_t index = 0; index < strlen(physicalSinkBT); index++)
         {
             if (physicalSinkBT[index] == ':')
                 physicalSinkBT[index] = '_';
         }
-        strncpy(u->physicalSinkBT, physicalSinkBT, sizeof(physicalSinkBT) - 1);
+        copy_field(u->physicalSinkBT, sizeof(u->physicalSinkBT), physicalSinkBT);
         if (NULL == u->btDiscoverModule)
             pa_log_info("%s :module-bluetooth-discover loading failed", __FUNCTION__);
         else
@@ -1968,7 +1975,7 @@ static bool load_lineout_alsa_sink(struct userdata *u, int soundcardNo, int devi
                 deviceList->deviceNumber = deviceNo;
                 deviceList->index = i;
                 pa_log("%s, %s,%s,%zu", __FUNCTION__, u->deviceName, deviceList->cardName, strlen(u->deviceName));
-                strncpy(deviceList->cardName, u->deviceName, SINK_NAME_LENGTH);
+                copy_field(deviceList->cardName, sizeof(deviceList->cardName), u->deviceName);
                 free(deviceList->cardNameDetail);
                 deviceList->cardNameDetail = NULL;
                 snd_card_get_name(soundcardNo, &(deviceList->cardNameDetail));
@@ -2010,7 +2017,7 @@ static bool load_lineout_alsa_sink(struct userdata *u, int soundcardNo, int devi
                 char *args = NULL;
                 deviceList->cardNumber = soundcardNo;
                 deviceList->deviceNumber = deviceNo;
-                strncpy(deviceList->cardName, u->deviceName, SINK_NAME_LENGTH);
+                copy_field(deviceList->cardName, sizeof(deviceList->cardName), u->deviceName);
 
                 free(deviceList->cardNameDetail);
                 deviceList->cardNameDetail = NULL;
@@ -2135,7 +2142,7 @@ static bool set_audio_effect(struct userdata *u, const char* effect, int enabled
     }
 
     char message[SIZE_MESG_TO_PULSE] = {0};
-    sprintf(message, "param %s %d", effect, enabled);
+    snprintf(message, sizeof(message), "param %s %d", effect, enabled);
     pa_palm_policy_set_param_data_t *spd;
     spd = pa_xnew0(pa_palm_policy_set_param_data_t, 1);
     if (spd)
@@ -2215,7 +2222,7 @@ static bool set_postprocess_effect(struct userdata *u, const char* effect, int e
             return true;
         }
         u->IsDRCEnabled = enabled;
-        sprintf(message, "dynamic_range_compressor enable %d", enabled);
+        snprintf(message, sizeof(message), "dynamic_range_compressor enable %d", enabled);
     }
     else if (strcmp("equalizer", effect) == 0)
     {
@@ -2225,7 +2232,7 @@ static bool set_postprocess_effect(struct userdata *u, const char* effect, int e
             return true;
         }
         u->IsEqualizerEnabled = enabled;
-        sprintf(message, "equalizer enable %d", enabled);
+        snprintf(message, sizeof(message), "equalizer enable %d", enabled);
     }
     else if (strcmp("bass_boost", effect) == 0)
     {
@@ -2235,7 +2242,7 @@ static bool set_postprocess_effect(struct userdata *u, const char* effect, int e
             return true;
         }
         u->IsBassBoostEnabled = enabled;
-        sprintf(message, "bass_boost enable %d", enabled);
+        snprintf(message, sizeof(message), "bass_boost enable %d", enabled);
     }
 
     pa_palm_policy_set_param_data_t *spd;
@@ -2260,7 +2267,7 @@ static bool set_equalizer_param(struct userdata *u, int preset, int band, int le
     if (!u->IsEqualizerEnabled) return false;
 
     char message[SIZE_MESG_TO_PULSE] = {0};
-    sprintf(message, "equalizer param %d %d %d", preset, band, level);
+    snprintf(message, sizeof(message), "equalizer param %d %d %d", preset, band, level);
     pa_palm_policy_set_param_data_t *spd;
     spd = pa_xnew0(pa_palm_policy_set_param_data_t, 1);
     if (spd)
@@ -2641,7 +2648,7 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
         {
             // 't'
             u->connectionPort = SndHdr->port;
-            strncpy(u->connectionType,SndHdr->device,50);// = "to fix incompatible pointer type";
+            copy_field(u->connectionType, RTP_CONNECTION_TYPE_STRING_SIZE, SndHdr->device);
             pa_log_info("received rtp load cmd from Audiod");
             pa_log_info("parse_message:received command t FOR RTP module port = %d", u->connectionPort);
             if (strcmp(u->connectionType, "unicast") == 0)
@@ -2661,7 +2668,7 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
             // 'l'
             /* walk list of sink-inputs on this stream and set
              * their output sink */
-            strncpy(u->address, SndHdr->address, BLUETOOTH_MAC_ADDRESS_SIZE);
+            copy_field(u->address, sizeof(u->address), SndHdr->address);
             pa_log_info("Bluetooth connected address %s", u->address);
             ret = load_Bluetooth_module(u);
             send_callback_to_audiod(msgHdr->msgID, ret, u);
@@ -3185,7 +3192,7 @@ int pa__init(pa_module *m)
     {
         u->sink_mapping_table[i].virtualsinkname = virtualsinkmap[i].virtualsinkname;
         u->sink_mapping_table[i].virtualsinkidentifier = virtualsinkmap[i].virtualsinkidentifier;
-        strncpy(u->sink_mapping_table[i].outputdevice, virtualsinkmap[i].outputdevice, DEVICE_NAME_LENGTH);
+        copy_field(u->sink_mapping_table[i].outputdevice, sizeof(u->sink_mapping_table[i].outputdevice), virtualsinkmap[i].outputdevice);
         u->sink_mapping_table[i].volumetable = virtualsinkmap[i].volumetable;
         u->sink_mapping_table[i].volume = virtualsinkmap[i].volume;
         u->sink_mapping_table[i].ismuted = virtualsinkmap[i].ismuted;
@@ -3206,7 +3213,7 @@ int pa__init(pa_module *m)
     {
         u->source_mapping_table[i].virtualsourcename = virtualsourcemap[i].virtualsourcename;
         u->source_mapping_table[i].virtualsourceidentifier = virtualsourcemap[i].virtualsourceidentifier;
-        strncpy(u->source_mapping_table[i].inputdevice, virtualsourcemap[i].inputdevice, DEVICE_NAME_LENGTH);
+        copy_field(u->source_mapping_table[i].inputdevice, sizeof(u->source_mapping_table[i].inputdevice), virtualsourcemap[i].inputdevice);
         u->source_mapping_table[i].volume = virtualsourcemap[i].volume;
         u->source_mapping_table[i].ismuted = virtualsourcemap[i].ismuted;
         u->source_mapping_table[i].volumetable = virtualsourcemap[i].volumetable;
@@ -3233,7 +3240,8 @@ int pa__init(pa_module *m)
     u->connectionType = (char *)pa_xmalloc0(RTP_CONNECTION_TYPE_STRING_SIZE);
     u->connectionPort = 0;
     u->deviceName = (char *)pa_xmalloc0(DEVICE_NAME_LENGTH);
-    u->callback_deviceName = (char *)pa_xmalloc0(DEVICE_NAME_LENGTH);
+    /* only ever borrows the name of the sink or source being reported */
+    u->callback_deviceName = NULL;
 
     u->btDiscoverModule = NULL;
     u->IsBluetoothEnabled = false;
@@ -3507,11 +3515,11 @@ static pa_hook_result_t route_sink_input_put_hook_callback(pa_core *c, pa_sink_i
     if (pa_proplist_gets(data->proplist, PA_PROP_APPLICATION_NAME) == NULL)
     {
         pa_log("Sink opened, application.name not a VALID key..hence adding empty name");
-        strncpy(si_data->appname, "", APP_NAME_LENGTH);
+        copy_field(si_data->appname, sizeof(si_data->appname), "");
     }
     else
     {
-        strncpy(si_data->appname, pa_proplist_gets(data->proplist, PA_PROP_APPLICATION_NAME), APP_NAME_LENGTH);
+        copy_field(si_data->appname, sizeof(si_data->appname), pa_proplist_gets(data->proplist, PA_PROP_APPLICATION_NAME));
     }
 
     if (pa_proplist_gets(data->proplist, PA_PROP_PREFERRED_DEVICE))
@@ -3570,8 +3578,7 @@ static pa_hook_result_t route_sink_input_put_hook_callback(pa_core *c, pa_sink_i
         policySet.Type = PAUDIOD_REPLY_MSGTYPE_SINK_OPEN;
         policySet.id = si_data->virtualsinkid;
         policySet.index = si_data->sinkinputidx;
-        strncpy(policySet.appName, si_data->appname, APP_NAME_LENGTH);
-        policySet.appName[APP_NAME_LENGTH - 1] = '\0';
+        copy_field(policySet.appName, sizeof(policySet.appName), si_data->appname);
 
         u->audiod_sink_input_opened[si_data->virtualsinkid]++;
 
@@ -3818,11 +3825,11 @@ static pa_hook_result_t route_source_output_put_hook_callback(pa_core *c, pa_sou
     if (pa_proplist_gets(so->proplist, PA_PROP_APPLICATION_NAME) == NULL)
     {
         pa_log("Source opened, application.name not a VALID key..hence adding empty name");
-        strncpy(node->appname, "", APP_NAME_LENGTH);
+        copy_field(node->appname, sizeof(node->appname), "");
     }
     else
     {
-        strncpy(node->appname, pa_proplist_gets(so->proplist, PA_PROP_APPLICATION_NAME), APP_NAME_LENGTH);
+        copy_field(node->appname, sizeof(node->appname), pa_proplist_gets(so->proplist, PA_PROP_APPLICATION_NAME));
     }
     pa_log("Source opened with application name:%s, source output index:%d",
            node->appname, node->sourceoutputidx);
@@ -3875,8 +3882,7 @@ static pa_hook_result_t route_source_output_put_hook_callback(pa_core *c, pa_sou
         policySet.Type = PAUDIOD_REPLY_MSGTYPE_SOURCE_OPEN;
         policySet.id = node->virtualsourceid;
         policySet.index = node->sourceoutputidx;
-        strncpy(policySet.appName, node->appname, APP_NAME_LENGTH);
-        policySet.appName[APP_NAME_LENGTH - 1] = '\0';
+        copy_field(policySet.appName, sizeof(policySet.appName), node->appname);
 
         ret = send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_POLICY, 0, &policySet, sizeof(policySet)) ? 0 : -1;
         if (ret == -1)
@@ -3948,8 +3954,7 @@ static pa_hook_result_t route_sink_input_unlink_hook_callback(pa_core *c, pa_sin
 
                     policySet.id = thelistitem->virtualsinkid;
                     policySet.index = thelistitem->sinkinputidx;
-                    strncpy(policySet.appName, thelistitem->appname, APP_NAME_LENGTH);
-                    policySet.appName[APP_NAME_LENGTH - 1] = '\0';
+                    copy_field(policySet.appName, sizeof(policySet.appName), thelistitem->appname);
 
                     if (!send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_POLICY, 0, &policySet, sizeof(policySet)))
                         pa_log_info("route_sink_input_unlink_hook_callback: send failed: %s", strerror(errno));
@@ -4011,8 +4016,7 @@ route_sink_input_state_changed_hook_callback(pa_core *c, pa_sink_input *data, st
 
                 policySet.id = thelistitem->virtualsinkid;
                 policySet.index = thelistitem->sinkinputidx;
-                strncpy(policySet.appName, thelistitem->appname, APP_NAME_LENGTH);
-                policySet.appName[APP_NAME_LENGTH - 1] = '\0';
+                copy_field(policySet.appName, sizeof(policySet.appName), thelistitem->appname);
 
 
                 // decrease sink opened count, even if audiod doesn't hear from it
@@ -4025,8 +4029,7 @@ route_sink_input_state_changed_hook_callback(pa_core *c, pa_sink_input *data, st
                 policySet.Type = PAUDIOD_REPLY_MSGTYPE_SINK_OPEN;
                 policySet.id = thelistitem->virtualsinkid;
                 policySet.index = thelistitem->sinkinputidx;
-                strncpy(policySet.appName, thelistitem->appname, APP_NAME_LENGTH);
-                policySet.appName[APP_NAME_LENGTH - 1] = '\0';
+                copy_field(policySet.appName, sizeof(policySet.appName), thelistitem->appname);
 
 
                 // increase sink opened count, even if audiod doesn't hear from it
@@ -4090,8 +4093,7 @@ static pa_hook_result_t route_source_output_state_changed_hook_callback(pa_core 
                 policySet.Type = PAUDIOD_REPLY_MSGTYPE_SOURCE_CLOSE;
                 policySet.id = node->virtualsourceid;
                 policySet.index = node->sourceoutputidx;
-                strncpy(policySet.appName, node->appname, APP_NAME_LENGTH);
-                policySet.appName[APP_NAME_LENGTH - 1] = '\0';
+                copy_field(policySet.appName, sizeof(policySet.appName), node->appname);
 
                 node->paused = true;
 
@@ -4106,8 +4108,7 @@ static pa_hook_result_t route_source_output_state_changed_hook_callback(pa_core 
                 policySet.Type = PAUDIOD_REPLY_MSGTYPE_SOURCE_OPEN;
                 policySet.id = node->virtualsourceid;
                 policySet.index = node->sourceoutputidx;
-                strncpy(policySet.appName, node->appname, APP_NAME_LENGTH);
-                policySet.appName[APP_NAME_LENGTH - 1] = '\0';
+                copy_field(policySet.appName, sizeof(policySet.appName), node->appname);
 
 
                 /* increase source opened count, even if audiod doesn't hear from it */
@@ -4170,8 +4171,7 @@ static pa_hook_result_t route_source_output_unlink_hook_callback(pa_core *c, pa_
 
                     policySet.id = thelistitem->virtualsourceid;
                     policySet.index = thelistitem->sourceoutputidx;
-                    strncpy(policySet.appName, thelistitem->appname, APP_NAME_LENGTH);
-                    policySet.appName[APP_NAME_LENGTH - 1] = '\0';
+                    copy_field(policySet.appName, sizeof(policySet.appName), thelistitem->appname);
 
 
                     if (!send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_POLICY, 0, &policySet, sizeof(policySet)))
@@ -4339,7 +4339,7 @@ pa_hook_result_t route_source_unlink_post_cb(pa_core *c, pa_source *source, stru
             memset(&routingSet, 0, sizeof(routingSet));
             routingSet.Type = PAUDIOD_REPLY_MSGTYPE_DEVICE_REMOVED;
             routingSet.isOutput = 0;
-            strncpy(routingSet.device, u->callback_deviceName, 50);
+            copy_field(routingSet.device, sizeof(routingSet.device), u->callback_deviceName);
             routingSet.deviceIcon[0] = '\0';
             routingSet.deviceNameDetail[0] = '\0';
 
@@ -4389,7 +4389,7 @@ pa_hook_result_t route_sink_unlink_cb(pa_core *c, pa_sink *sink, struct userdata
                 routingSet.deviceIcon[0] = '\0';
                 routingSet.deviceNameDetail[0] = '\0';
 
-                strncpy(routingSet.device, u->callback_deviceName, 50);
+                copy_field(routingSet.device, sizeof(routingSet.device), u->callback_deviceName);
 
                 ret = send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_ROUTING, 0, &routingSet, sizeof(routingSet)) ? 0 : -1;
                 if (-1 == ret)
@@ -4424,7 +4424,7 @@ pa_hook_result_t route_sink_unlink_cb(pa_core *c, pa_sink *sink, struct userdata
                 routingSet.isOutput = 1;
                 routingSet.deviceIcon[0] = '\0';
                 routingSet.deviceNameDetail[0] = '\0';
-                strncpy(routingSet.device, u->callback_deviceName, 50);
+                copy_field(routingSet.device, sizeof(routingSet.device), u->callback_deviceName);
 
                 /* we have a connection send a message to audioD */
 
@@ -4465,11 +4465,10 @@ static pa_hook_result_t source_load_subscription_callback(pa_core *c, pa_source_
             struct paReplyToRoutingSet routingSet;
             memset(&routingSet, 0, sizeof(routingSet));
             routingSet.Type = PAUDIOD_REPLY_MSGTYPE_DEVICE_CONNECTION;
-            strncpy(routingSet.device, u->callback_deviceName, 50);
-            strncpy(routingSet.deviceNameDetail, deviceNameDetail, 50);
-            strncpy(routingSet.deviceIcon, deviceIcon, DEVICE_NAME_LENGTH);
+            copy_field(routingSet.device, sizeof(routingSet.device), u->callback_deviceName);
+            copy_field(routingSet.deviceNameDetail, sizeof(routingSet.deviceNameDetail), deviceNameDetail);
+            copy_field(routingSet.deviceIcon, sizeof(routingSet.deviceIcon), deviceIcon);
             routingSet.isOutput = 0; // false
-            routingSet.deviceNameDetail[49] = 0;
 
             /* we have a connection send a message to audioD */
             ret = send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_ROUTING, 0, &routingSet, sizeof(routingSet)) ? 0 : -1;
@@ -4515,11 +4514,10 @@ pa_hook_result_t sink_load_subscription_callback(pa_core *c, pa_sink_new_data *d
                 struct paReplyToRoutingSet routingSet;
                 memset(&routingSet, 0, sizeof(routingSet));
                 routingSet.Type = PAUDIOD_REPLY_MSGTYPE_DEVICE_CONNECTION;
-                strncpy(routingSet.device, u->callback_deviceName, 50);
-                strncpy(routingSet.deviceNameDetail, deviceNameDetail, 50);
-                strncpy(routingSet.deviceIcon, deviceIcon, DEVICE_NAME_LENGTH);
+                copy_field(routingSet.device, sizeof(routingSet.device), u->callback_deviceName);
+                copy_field(routingSet.deviceNameDetail, sizeof(routingSet.deviceNameDetail), deviceNameDetail);
+                copy_field(routingSet.deviceIcon, sizeof(routingSet.deviceIcon), deviceIcon);
                 routingSet.isOutput = 1; // true
-                routingSet.deviceNameDetail[49] = 0;
 
                 /* we have a connection send a message to audioD */
                 ret = send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_ROUTING, 0, &routingSet, sizeof(routingSet)) ? 0 : -1;
@@ -4555,10 +4553,9 @@ pa_hook_result_t sink_load_subscription_callback(pa_core *c, pa_sink_new_data *d
                 struct paReplyToRoutingSet routingSet;
                 memset(&routingSet, 0, sizeof(routingSet));
                 routingSet.Type = PAUDIOD_REPLY_MSGTYPE_DEVICE_CONNECTION;
-                strncpy(routingSet.device, u->callback_deviceName, 50);
-                strncpy(routingSet.deviceNameDetail, deviceNameDetail, 50);
-                strncpy(routingSet.deviceIcon, deviceIcon, DEVICE_NAME_LENGTH);
-                routingSet.deviceNameDetail[49] = 0;
+                copy_field(routingSet.device, sizeof(routingSet.device), u->callback_deviceName);
+                copy_field(routingSet.deviceNameDetail, sizeof(routingSet.deviceNameDetail), deviceNameDetail);
+                copy_field(routingSet.deviceIcon, sizeof(routingSet.deviceIcon), deviceIcon);
                 routingSet.isOutput = 1; // true
 
                 /* we have a connection send a message to audioD */
