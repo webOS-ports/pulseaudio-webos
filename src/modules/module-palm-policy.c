@@ -760,7 +760,7 @@ bool detect_usb_device(struct userdata *u, bool isOutput, int cardNumber, int de
     return true;
 }
 
-char *get_device_name_from_detail(char *deviceDetail, struct userdata *u, bool isOutput)
+const char *get_device_name_from_detail(const char *deviceDetail, struct userdata *u, bool isOutput)
 {
     pa_log_debug("%s, deviceDetail:%s stream", __FUNCTION__, deviceDetail);
     if (isOutput)
@@ -820,7 +820,7 @@ char *get_device_name_from_detail(char *deviceDetail, struct userdata *u, bool i
     return deviceDetail;
 }
 
-void find_and_load_usb_devices(struct userdata *u, char *deviceName, snd_pcm_stream_t stream)
+void find_and_load_usb_devices(struct userdata *u, const char *deviceName, snd_pcm_stream_t stream)
 {
     pa_assert(u);
     pa_assert(deviceName);
@@ -1875,7 +1875,7 @@ static bool unload_rtp_module(struct userdata *u)
     return true;
 }
 
-void send_rtp_connection_data_to_audiod(char *ip, char *port, struct userdata *u)
+void send_rtp_connection_data_to_audiod(const char *ip, const char *port, struct userdata *u)
 {
     pa_assert(ip);
     pa_assert(port);
@@ -2088,7 +2088,7 @@ static bool set_audio_effect(struct userdata *u, const char* effect, int enabled
         destsink = pa_namereg_get(u->core, "preprocess_sink", PA_NAMEREG_SINK);
 
         for (thelistitem = u->sinkinputnodelist; thelistitem != NULL; thelistitem = thelistitem->next) {
-            char* media_name = pa_proplist_gets(thelistitem->sinkinput->proplist, "media.name");
+            const char *media_name = pa_proplist_gets(thelistitem->sinkinput->proplist, "media.name");
             if ((media_name) && (strcmp(media_name, "preprocess Stream") == 0)) {
                 thelistitem->sinkinput->origin_sink = NULL;
                 thelistitem->sinkinput->volume_writable = true;
@@ -2116,7 +2116,7 @@ static bool set_audio_effect(struct userdata *u, const char* effect, int enabled
         destsource = pa_namereg_get(u->core, "preprocess-source", PA_NAMEREG_SOURCE);
 
         for (item = u->sourceoutputnodelist; item != NULL; item = item->next) {
-            char* media_name = pa_proplist_gets(item->sourceoutput->proplist, "media.name");
+            const char *media_name = pa_proplist_gets(item->sourceoutput->proplist, "media.name");
             if ((media_name) && (strcmp(media_name, "preprocess Stream") == 0)) {
                 item->sourceoutput->destination_source = NULL;
                 item->sourceoutput->volume_writable = true;
@@ -2172,7 +2172,7 @@ static bool set_audio_effect(struct userdata *u, const char* effect, int enabled
 
             for (item = u->sourceoutputnodelist; item != NULL; item = item->next)
             {
-                char *media_name = pa_proplist_gets(item->sourceoutput->proplist, "media.name");
+                const char *media_name = pa_proplist_gets(item->sourceoutput->proplist, "media.name");
                 if ((media_name) && (strcmp(media_name, "preprocess Stream") == 0))
                 {
                 }
@@ -3302,12 +3302,12 @@ static pa_hook_result_t route_sink_input_new_hook_callback(pa_core *c, pa_sink_i
 
     type = pa_proplist_new();
 
-    char *media_name = pa_proplist_gets(data->proplist, "media.name");
+    const char *media_name = pa_proplist_gets(data->proplist, "media.name");
     // For handling void stream
-    char *pref_device = pa_proplist_gets(data->proplist, PA_PROP_PREFERRED_DEVICE);
+    const char *pref_device = pa_proplist_gets(data->proplist, PA_PROP_PREFERRED_DEVICE);
     if (data->sink != NULL && pref_device != NULL)
     {
-        char *actualDeviceName = get_device_name_from_detail(pref_device, u, true);
+        const char *actualDeviceName = get_device_name_from_detail(pref_device, u, true);
         pa_proplist_sets(type, "media.type", data->sink->name);
         pa_proplist_update(data->proplist, PA_UPDATE_MERGE, type);
         if (actualDeviceName)
@@ -3381,7 +3381,7 @@ static pa_hook_result_t route_sink_input_new_hook_callback(pa_core *c, pa_sink_i
     else if ((NULL != data->sink) && sink_index == edefaultapp && (!(pa_streq(data->sink->driver, MODULE_NULL_SINK))))
     {
         pa_log_info("data->sink->name : %s", data->sink->name);
-        char *app_name = pa_proplist_gets(data->proplist, PA_PROP_APPLICATION_NAME);
+        const char *app_name = pa_proplist_gets(data->proplist, PA_PROP_APPLICATION_NAME);
         if (app_name && !strncmp(app_name, "Chromium", strlen("Chromium")))
         {
             pa_proplist_sets(type, "media.type", "voipcall");
@@ -3580,7 +3580,7 @@ static pa_hook_result_t route_sink_input_put_hook_callback(pa_core *c, pa_sink_i
 
     if (u->preprocess_module && si_data->virtualsinkid == u->PreprocessSinkId)
     {
-        char *media_name = pa_proplist_gets(data->proplist, "media.name");
+        const char *media_name = pa_proplist_gets(data->proplist, "media.name");
         if ((media_name) && (strcmp(media_name, "preprocess Stream") == 0))
         {
         }
@@ -3613,7 +3613,7 @@ static pa_hook_result_t route_source_output_new_hook_callback(pa_core *c, pa_sou
     pa_proplist *stream_type;
     pa_proplist *a;
     pa_source *source;
-    char *port, *dest_ip, *prop_name;
+    const char *port, *dest_ip, *prop_name;
     pa_assert(data);
     pa_assert(u);
     pa_assert(c);
@@ -3621,9 +3621,9 @@ static pa_hook_result_t route_source_output_new_hook_callback(pa_core *c, pa_sou
     prop_name = pa_strnull(pa_proplist_gets(data->proplist, PA_PROP_MEDIA_NAME));
     stream_type = pa_proplist_new();
 
-    char *media_name = pa_proplist_gets(data->proplist, "media.name");
-    char *app_name = pa_proplist_gets(data->proplist, PA_PROP_APPLICATION_NAME);
-    char *pref_device = pa_proplist_gets(data->proplist, PA_PROP_PREFERRED_DEVICE);
+    const char *media_name = pa_proplist_gets(data->proplist, "media.name");
+    const char *app_name = pa_proplist_gets(data->proplist, PA_PROP_APPLICATION_NAME);
+    const char *pref_device = pa_proplist_gets(data->proplist, PA_PROP_PREFERRED_DEVICE);
 
     if (!strcmp(prop_name, "RTP Monitor Stream"))
     {
@@ -3672,7 +3672,7 @@ static pa_hook_result_t route_source_output_new_hook_callback(pa_core *c, pa_sou
     else if (pref_device)
     {
         pa_log("preferred device is used to create this stream");
-        char *actualDeviceName = get_device_name_from_detail(pref_device, u, false);
+        const char *actualDeviceName = get_device_name_from_detail(pref_device, u, false);
         if (data->source)
             pa_proplist_sets(stream_type, "media.type", data->source->name);
         else
@@ -3881,7 +3881,7 @@ static pa_hook_result_t route_source_output_put_hook_callback(pa_core *c, pa_sou
 
     if(u->preprocess_module && node->virtualsourceid == u->PreprocessSourceId)
     {
-        char *media_name = pa_proplist_gets(so->proplist, "media.name");
+        const char *media_name = pa_proplist_gets(so->proplist, "media.name");
         if ((media_name) && (strcmp(media_name, "preprocess Stream") == 0))
         {
         }
@@ -4394,8 +4394,8 @@ pa_hook_result_t route_sink_unlink_cb(pa_core *c, pa_sink *sink, struct userdata
     }
     else
     {
-        char *deviceNameDetail;
-        char *deviceIcon;
+        const char *deviceNameDetail;
+        const char *deviceIcon;
         if (sink->module && pa_streq(sink->module->name, MODULE_ALSA_SINK_NAME))
         {
             u->callback_deviceName = sink->name;
@@ -4440,10 +4440,10 @@ static pa_hook_result_t source_load_subscription_callback(pa_core *c, pa_source_
     /* a source need not belong to a module; only ALSA sources matter here */
     if (data->module && pa_streq(data->module->name, MODULE_ALSA_SOURCE_NAME))
     {
-        char *deviceNameDetail;
+        const char *deviceNameDetail;
         u->callback_deviceName = data->name;
         deviceNameDetail = pa_proplist_gets(data->proplist, ALSA_CARD_NAME);
-        char *deviceIcon = pa_proplist_gets(data->proplist, PA_PROP_DEVICE_ICON_NAME);
+        const char *deviceIcon = pa_proplist_gets(data->proplist, PA_PROP_DEVICE_ICON_NAME);
         if (!deviceNameDetail)
             deviceNameDetail = data->name;
         /* notify audiod of device insertion */
@@ -4486,8 +4486,8 @@ pa_hook_result_t sink_load_subscription_callback(pa_core *c, pa_sink_new_data *d
     pa_assert(u);
     if (strstr(data->name, "bluez_sink."))
     {
-        char *deviceNameDetail;
-        char *deviceIcon;
+        const char *deviceNameDetail;
+        const char *deviceIcon;
 
         deviceNameDetail = pa_proplist_gets(data->card->proplist, "bluez.alias");
         deviceIcon = pa_proplist_gets(data->card->proplist, PA_PROP_DEVICE_ICON_NAME);
@@ -4523,8 +4523,8 @@ pa_hook_result_t sink_load_subscription_callback(pa_core *c, pa_sink_new_data *d
     }
     else
     {
-        char *deviceNameDetail;
-        char *deviceIcon;
+        const char *deviceNameDetail;
+        const char *deviceIcon;
         if (pa_streq(data->module->name, MODULE_ALSA_SINK_NAME))
         {
             u->callback_deviceName = data->name;
