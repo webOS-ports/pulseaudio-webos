@@ -3358,10 +3358,13 @@ static pa_hook_result_t route_sink_input_new_hook_callback(pa_core *c, pa_sink_i
         pa_log_info("THE DEFAULT DEVICE WAS USED TO CREATE THIS STREAM - PLEASE CATEGORIZE USING A VIRTUAL STREAM");
         const char *role = pa_proplist_gets(data->proplist, "media.role");
         const char *virtualsink;
-        /* The music role was meant for btstream (A2DP), but the code that set
-         * it fell through into the default branch, so such streams have always
-         * gone to pdefaultapp. Keep that until the routing can be verified on
-         * a device; only the phone role has ever reached its own sink. */
+        /* LG's fork meant streams of the music role for btstream (A2DP),
+         * but that branch fell through into the default one, so they have
+         * always gone to pdefaultapp - which is also what webOS's own
+         * module-palm-policy did: its new-stream hook has no role routing
+         * and puts every stream that comes without a sink on the default
+         * application sink. audiod routes btstream no differently and only
+         * keeps a volume policy for it. Only the phone role goes elsewhere. */
         if (role && 0 == strncmp(role, "phone", 5))
         {
             virtualsink = "btcall";
