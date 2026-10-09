@@ -285,6 +285,50 @@ struct userdata
     pa_palm_policy *palm_policy;
 };
 
+/* Every message to audiod is exactly SIZE_MESG_TO_AUDIOD bytes: audiod reads
+ * fixed-size records. The largest reply has to fit in one. */
+_Static_assert(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToRoutingSet) <= SIZE_MESG_TO_AUDIOD,
+               "routing reply does not fit in a message to audiod");
+_Static_assert(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToModuleSet) <= SIZE_MESG_TO_AUDIOD,
+               "module reply does not fit in a message to audiod");
+_Static_assert(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToPolicySet) <= SIZE_MESG_TO_AUDIOD,
+               "policy reply does not fit in a message to audiod");
+_Static_assert(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToAudiod) <= SIZE_MESG_TO_AUDIOD,
+               "callback reply does not fit in a message to audiod");
+
+/* Send one message to audiod: the header, the payload, and zeroes up to the
+ * fixed record size, so that nothing beyond the payload - heap or stack - goes
+ * out with it. Returns false if there is no connection or the send failed. */
+static bool send_to_audiod(struct userdata *u, uint32_t msgType, uint32_t msgID, const void *payload, size_t len)
+{
+    char buf[SIZE_MESG_TO_AUDIOD];
+    struct paudiodMsgHdr hdr;
+
+    pa_assert(u);
+    pa_assert(sizeof(hdr) + len <= sizeof(buf));
+
+    if (!u->connectionactive || u->newsockfd == -1)
+        return false;
+
+    memset(buf, 0, sizeof(buf));
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.msgType = msgType;
+    hdr.msgTmp = 0x01;
+    hdr.msgVer = 1;
+    hdr.msgLen = sizeof(hdr);
+    hdr.msgID = msgID;
+    memcpy(buf, &hdr, sizeof(hdr));
+    if (len)
+        memcpy(buf + sizeof(hdr), payload, len);
+
+    if (send(u->newsockfd, buf, sizeof(buf), MSG_NOSIGNAL) != (ssize_t)sizeof(buf))
+    {
+        pa_log("send to audiod failed: %s", strerror(errno));
+        return false;
+    }
+    return true;
+}
+
 static bool virtual_source_output_move_inputdevice(int virtualsourceid, char *inputdevice, struct userdata *u);
 
 static bool virtual_source_set_mute(int sourceid, int mute, struct userdata *u);
@@ -1584,8 +1628,6 @@ static bool load_unicast_rtp_module(struct userdata *u)
 {
     char *args = NULL;
     pa_assert(u != NULL);
-    char audiodbuf[SIZE_MESG_TO_AUDIOD];
-    memset(audiodbuf, 0, sizeof(audiodbuf));
 
     /* Request for Unicast RTP
      * Client Provides Destination IP & Port (Optional)
@@ -1614,32 +1656,15 @@ static bool load_unicast_rtp_module(struct userdata *u)
     if (!u->rtp_module)
     {
         pa_log("Error loading in module-rtp-send");
-        // added for message Type
-        struct paudiodMsgHdr paudioReplyMsgHdr;
-        paudioReplyMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_MODULE;
-        paudioReplyMsgHdr.msgTmp = 0x01;
-        paudioReplyMsgHdr.msgVer = 1;
-        paudioReplyMsgHdr.msgLen = sizeof(struct paudiodMsgHdr);
-        paudioReplyMsgHdr.msgID = 0;
-
+        /* No address to report: the module did not load. */
         struct paReplyToModuleSet moduleSet;
+        memset(&moduleSet, 0, sizeof(moduleSet));
         moduleSet.Type = PAUDIOD_REPLY_MODULE_CAST_RTP;
         moduleSet.sink = 0;
         moduleSet.info = 1;
-        // moduleSet.ip[0];
         moduleSet.port = 0;
-        strncpy(moduleSet.ip, (char *)NULL, 50);
-        moduleSet.ip[49] = 0;
-        // moduleSet.ip[50] = {'\0'};
 
-        char *audiobuf = (char *)malloc(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToModuleSet));
-
-        // copying....
-        memcpy(audiobuf, &paudioReplyMsgHdr, sizeof(struct paudiodMsgHdr));
-        memcpy(audiobuf + sizeof(struct paudiodMsgHdr), &moduleSet, sizeof(struct paReplyToModuleSet));
-
-        // snprintf(audiodbuf, SIZE_MESG_TO_AUDIOD, "t %d %d %s %d", 0, 1, (char *)NULL, 0);
-        if (-1 == send(u->newsockfd, audiodbuf, SIZE_MESG_TO_AUDIOD, 0))
+        if (!send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_MODULE, 0, &moduleSet, sizeof(moduleSet)))
             pa_log("Failed to send message to audiod ");
         else
             pa_log("Error in Loading RTP Module message sent to audiod");
@@ -1701,8 +1726,6 @@ static bool load_multicast_rtp_module(struct userdata *u)
 {
     char *args = NULL;
     pa_assert(u != NULL);
-    char audiodbuf[SIZE_MESG_TO_AUDIOD];
-    memset(audiodbuf, 0, sizeof(audiodbuf));
 
     /* Request for Multicast RTP
      * Client Provides Destination IP(Optional) & Port (Optional)
@@ -1745,29 +1768,15 @@ static bool load_multicast_rtp_module(struct userdata *u)
     if (!u->rtp_module)
     {
         pa_log("Error loading in module-rtp-send");
-        // added for message Type
-        struct paudiodMsgHdr paudioReplyMsgHdr;
-        paudioReplyMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_MODULE;
-        paudioReplyMsgHdr.msgTmp = 0x01;
-        paudioReplyMsgHdr.msgVer = 1;
-        paudioReplyMsgHdr.msgLen = sizeof(struct paudiodMsgHdr);
-        paudioReplyMsgHdr.msgID = 0;
-
+        /* No address to report: the module did not load. */
         struct paReplyToModuleSet moduleSet;
+        memset(&moduleSet, 0, sizeof(moduleSet));
         moduleSet.Type = PAUDIOD_REPLY_MODULE_CAST_RTP;
         moduleSet.sink = 0;
         moduleSet.info = 1;
         moduleSet.port = 0;
-        strncpy(moduleSet.ip, (char *)NULL, 50);
-        moduleSet.ip[49] = 0;
 
-        char *audiobuf = (char *)malloc(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToModuleSet));
-
-        // copying....
-        memcpy(audiobuf, &paudioReplyMsgHdr, sizeof(struct paudiodMsgHdr));
-        memcpy(audiobuf + sizeof(struct paudiodMsgHdr), &moduleSet, sizeof(struct paReplyToModuleSet));
-        // snprintf(audiodbuf, SIZE_MESG_TO_AUDIOD, "t %d %d %s %d", 0, 1, (char *)NULL, 0);
-        if (-1 == send(u->newsockfd, audiodbuf, SIZE_MESG_TO_AUDIOD, 0))
+        if (!send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_MODULE, 0, &moduleSet, sizeof(moduleSet)))
             pa_log("Failed to send message to audiod ");
         else
             pa_log("Error in Loading RTP Module message sent to audiod");
@@ -1792,33 +1801,19 @@ void send_rtp_connection_data_to_audiod(char *ip, char *port, struct userdata *u
     pa_assert(ip);
     pa_assert(port);
     int port_value = atoi(port);
-    char audiodbuf[SIZE_MESG_TO_AUDIOD];
-    memset(audiodbuf, 0, sizeof(audiodbuf));
 
     pa_log("[send_rtp_connection_data_to_audiod] ip = %s port = %d", ip, port_value);
-    // added for message Type
-    struct paudiodMsgHdr paudioReplyMsgHdr;
-    paudioReplyMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_MODULE;
-    paudioReplyMsgHdr.msgTmp = 0x01;
-    paudioReplyMsgHdr.msgVer = 1;
-    paudioReplyMsgHdr.msgLen = sizeof(struct paudiodMsgHdr);
-    paudioReplyMsgHdr.msgID = 0;
-
+    /* The connection that module-rtp-send set up: its address and port, as the
+     * old text form of this message ("t 0 0 <ip> <port>") carried them. */
     struct paReplyToModuleSet moduleSet;
+    memset(&moduleSet, 0, sizeof(moduleSet));
     moduleSet.Type = PAUDIOD_REPLY_MODULE_CAST_RTP;
     moduleSet.sink = 0;
-    moduleSet.info = 1;
-    moduleSet.port = 0;
-    strncpy(moduleSet.ip, (char *)NULL, 50);
-    moduleSet.ip[49] = 0;
+    moduleSet.info = 0;
+    moduleSet.port = port_value;
+    snprintf(moduleSet.ip, sizeof(moduleSet.ip), "%s", ip);
 
-    char *audiobuf = (char *)malloc(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToModuleSet));
-
-    // copying....
-    memcpy(audiobuf, &paudioReplyMsgHdr, sizeof(struct paudiodMsgHdr));
-    memcpy(audiobuf + sizeof(struct paudiodMsgHdr), &moduleSet, sizeof(struct paReplyToModuleSet));
-    // snprintf(audiodbuf, SIZE_MESG_TO_AUDIOD, "t %d %d %s %d", 0 , 0, ip, port_value);
-    if (-1 == send(u->newsockfd, audiodbuf, SIZE_MESG_TO_AUDIOD, 0))
+    if (!send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_MODULE, 0, &moduleSet, sizeof(moduleSet)))
         pa_log("Failed to send message to audiod ");
     else
         pa_log("Message sent to audiod");
@@ -2206,26 +2201,15 @@ void send_callback_to_audiod(int id, int returnVal, struct userdata *u)
 {
     pa_log_info("%s : %d,%d", __FUNCTION__, id, returnVal);
 
-    struct paudiodMsgHdr audioMsgHdr;
-    audioMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_CALLBACK;
-    audioMsgHdr.msgTmp = 0x01;
-    audioMsgHdr.msgVer = 1;
-    audioMsgHdr.msgLen = sizeof(struct paudiodMsgHdr);
-    audioMsgHdr.msgID = 0;
-
     struct paReplyToAudiod vSink;
+    memset(&vSink, 0, sizeof(vSink));
     vSink.id = id;
     vSink.returnValue = returnVal;
 
-    char *audiodbuf = (char *)malloc(sizeof(struct paReplyToAudiod) + sizeof(struct paudiodMsgHdr));
-    memcpy(audiodbuf, &audioMsgHdr, sizeof(struct paudiodMsgHdr));
-    memcpy((audiodbuf + sizeof(struct paudiodMsgHdr)), &vSink, sizeof(struct paReplyToAudiod));
-
-    if (-1 == send(u->newsockfd, audiodbuf, SIZE_MESG_TO_AUDIOD, 0))
+    if (!send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_CALLBACK, 0, &vSink, sizeof(vSink)))
         pa_log("Failed to send message to audiod from pulseaudio");
     else
         pa_log("message sent to audiod from pulseaudio");
-    return;
 }
 
 /* Parse a message sent from audiod and invoke
@@ -2735,15 +2719,13 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
 static void handle_io_event_socket(pa_mainloop_api *ea, pa_io_event *e, int fd, pa_io_event_flags_t events, void *userdata)
 {
     struct userdata *u = userdata;
-    int itslen;
+    struct sockaddr_un peer;
+    socklen_t peerlen = sizeof(peer);
     int sink;
     int source;
-    char audiodbuf[SIZE_MESG_TO_AUDIOD];
 
     pa_assert(u);
     pa_assert(fd == u->sockfd);
-
-    itslen = SUN_LEN(&u->name);
 
     if (events & PA_IO_EVENT_NULL)
     {
@@ -2754,7 +2736,7 @@ static void handle_io_event_socket(pa_mainloop_api *ea, pa_io_event *e, int fd, 
         /* do we have a connection on our socket yet? */
         if (-1 == u->newsockfd)
         {
-            if (-1 == (u->newsockfd = accept(u->sockfd, &(u->name), &itslen)))
+            if (-1 == (u->newsockfd = accept(u->sockfd, (struct sockaddr *)&peer, &peerlen)))
             {
                 pa_log_info("handle_io_event_socket could not create new connection on socket:%s", strerror(errno));
             }
@@ -2774,27 +2756,14 @@ static void handle_io_event_socket(pa_mainloop_api *ea, pa_io_event *e, int fd, 
                 {
                     if (u->audiod_sink_input_opened[sink] > 0)
                     {
-                        // added for message Type
-                        struct paudiodMsgHdr paudioReplyMsgHdr;
-                        paudioReplyMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_POLICY;
-                        paudioReplyMsgHdr.msgTmp = 0x01;
-                        paudioReplyMsgHdr.msgVer = 1;
-                        paudioReplyMsgHdr.msgLen = sizeof(struct paudiodMsgHdr);
-                        paudioReplyMsgHdr.msgID = 0;
-
                         struct paReplyToPolicySet policySet;
+                        memset(&policySet, 0, sizeof(policySet));
                         policySet.Type = PAUDIOD_REPLY_POLICY_SINK_CATEGORY;
                         policySet.stream = sink;
                         policySet.count = u->audiod_sink_input_opened[sink];
 
-                        char *audiobuf = (char *)malloc(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToPolicySet));
-
-                        // copying....
-                        memcpy(audiobuf, &paudioReplyMsgHdr, sizeof(struct paudiodMsgHdr));
-                        memcpy(audiobuf + sizeof(struct paudiodMsgHdr), &policySet, sizeof(struct paReplyToPolicySet));
-
-                        if (-1 == send(u->newsockfd, audiodbuf, SIZE_MESG_TO_AUDIOD, 0))
-                            pa_log("handle_io_event_socket: send failed: %s", strerror(errno));
+                        if (!send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_POLICY, 0, &policySet, sizeof(policySet)))
+                            pa_log("handle_io_event_socket: send failed");
                         else
                             pa_log_info("handle_io_event_socket: stream count for sink %d (%d)",
                                         sink, u->audiod_sink_input_opened[sink]);
@@ -2806,25 +2775,14 @@ static void handle_io_event_socket(pa_mainloop_api *ea, pa_io_event *e, int fd, 
                 {
                     if (u->audiod_source_output_opened[source] > 0)
                     {
-                        // added for message Type
-                        struct paudiodMsgHdr paudioReplyMsgHdr;
-                        paudioReplyMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_POLICY;
-                        paudioReplyMsgHdr.msgTmp = 0x01;
-                        paudioReplyMsgHdr.msgVer = 1;
-                        paudioReplyMsgHdr.msgLen = sizeof(struct paudiodMsgHdr);
-                        paudioReplyMsgHdr.msgID = 0;
-
                         struct paReplyToPolicySet policySet;
+                        memset(&policySet, 0, sizeof(policySet));
                         policySet.Type = PAUDIOD_REPLY_POLICY_SOURCE_CATEGORY;
                         policySet.stream = source;
                         policySet.count = u->audiod_source_output_opened[source];
-                        char *audiobuf = (char *)malloc(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToPolicySet));
-                        // copying....
-                        memcpy(audiobuf, &paudioReplyMsgHdr, sizeof(struct paudiodMsgHdr));
-                        memcpy(audiobuf + sizeof(struct paudiodMsgHdr), &policySet, sizeof(struct paReplyToPolicySet));
 
-                        if (-1 == send(u->newsockfd, audiobuf, SIZE_MESG_TO_AUDIOD, 0))
-                            pa_log("handle_io_event_socket: send failed: %s", strerror(errno));
+                        if (!send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_POLICY, 0, &policySet, sizeof(policySet)))
+                            pa_log("handle_io_event_socket: send failed");
                         else
                             pa_log_info("handle_io_event_socket: stream count for source %d (%d)",
                                         source, u->audiod_source_output_opened[source]);
@@ -3477,37 +3435,21 @@ static pa_hook_result_t route_sink_input_put_hook_callback(pa_core *c, pa_sink_i
     /* notify audiod of stream open */
     if (u->connectionactive && u->connev)
     {
-        // char audiobuf[SIZE_MESG_TO_AUDIOD];
         int ret;
         /* we have a connection send a message to audioD */
         si_data->paused = false;
-        // added for message Type
-        struct paudiodMsgHdr paudioReplyMsgHdr;
-        paudioReplyMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_POLICY;
-        paudioReplyMsgHdr.msgTmp = 0x01;
-        paudioReplyMsgHdr.msgVer = 1;
-        paudioReplyMsgHdr.msgLen = sizeof(struct paudiodMsgHdr);
-        paudioReplyMsgHdr.msgID = 0;
 
         struct paReplyToPolicySet policySet;
+        memset(&policySet, 0, sizeof(policySet));
         policySet.Type = PAUDIOD_REPLY_MSGTYPE_SINK_OPEN;
         policySet.id = si_data->virtualsinkid;
         policySet.index = si_data->sinkinputidx;
         strncpy(policySet.appName, si_data->appname, APP_NAME_LENGTH);
         policySet.appName[APP_NAME_LENGTH - 1] = '\0';
 
-        char *audiobuf = (char *)malloc(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToPolicySet));
-
-        // copying....
-        memcpy(audiobuf, &paudioReplyMsgHdr, sizeof(struct paudiodMsgHdr));
-        memcpy(audiobuf + sizeof(struct paudiodMsgHdr), &policySet, sizeof(struct paReplyToPolicySet));
-
-        /*
-            change msg signal back to 's' when platform audiod is merged*/
-        // sprintf(audiobuf, "o %d %d %s", si_data->virtualsinkid, si_data->sinkinputidx, si_data->appname);
         u->audiod_sink_input_opened[si_data->virtualsinkid]++;
 
-        ret = send(u->newsockfd, audiobuf, SIZE_MESG_TO_AUDIOD, 0);
+        ret = send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_POLICY, 0, &policySet, sizeof(policySet)) ? 0 : -1;
         if (-1 == ret)
             pa_log("send() failed: %s", strerror(errno));
         else
@@ -3790,30 +3732,17 @@ static pa_hook_result_t route_source_output_put_hook_callback(pa_core *c, pa_sou
     }
     if (u->connectionactive && u->connev)
     {
-        // char audiobuf[SIZE_MESG_TO_AUDIOD];
         int ret;
-        // added for message Type
-        struct paudiodMsgHdr paudioReplyMsgHdr;
-        paudioReplyMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_POLICY;
-        paudioReplyMsgHdr.msgTmp = 0x01;
-        paudioReplyMsgHdr.msgVer = 1;
-        paudioReplyMsgHdr.msgLen = sizeof(struct paudiodMsgHdr);
-        paudioReplyMsgHdr.msgID = 0;
 
         struct paReplyToPolicySet policySet;
+        memset(&policySet, 0, sizeof(policySet));
         policySet.Type = PAUDIOD_REPLY_MSGTYPE_SOURCE_OPEN;
         policySet.id = node->virtualsourceid;
         policySet.index = node->sourceoutputidx;
         strncpy(policySet.appName, node->appname, APP_NAME_LENGTH);
         policySet.appName[APP_NAME_LENGTH - 1] = '\0';
 
-        char *audiobuf = (char *)malloc(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToPolicySet));
-        // copying....
-        memcpy(audiobuf, &paudioReplyMsgHdr, sizeof(struct paudiodMsgHdr));
-        memcpy(audiobuf + sizeof(struct paudiodMsgHdr), &policySet, sizeof(struct paReplyToPolicySet));
-
-        // sprintf(audiobuf, "d %d %d %s", node->virtualsourceid, node->sourceoutputidx, node->appname);
-        ret = send(u->newsockfd, audiobuf, SIZE_MESG_TO_AUDIOD, 0);
+        ret = send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_POLICY, 0, &policySet, sizeof(policySet)) ? 0 : -1;
         if (ret == -1)
             pa_log("Record stream type(%s): send failed(%s)", so_type, strerror(errno));
     }
@@ -3848,7 +3777,6 @@ static pa_hook_result_t route_source_output_put_hook_callback(pa_core *c, pa_sou
 /* callback for stream deletion */
 static pa_hook_result_t route_sink_input_unlink_hook_callback(pa_core *c, pa_sink_input *data, struct userdata *u)
 {
-    char audiodbuf[SIZE_MESG_TO_AUDIOD];
     struct sinkinputnode *thelistitem = NULL;
 
     pa_assert(data);
@@ -3877,15 +3805,9 @@ static pa_hook_result_t route_sink_input_unlink_hook_callback(pa_core *c, pa_sin
 
                     pa_log("Sink closed with application name:%s, sink input index:%d",
                            thelistitem->appname, thelistitem->sinkinputidx);
-                    // added for message Type
-                    struct paudiodMsgHdr paudioReplyMsgHdr;
-                    paudioReplyMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_POLICY;
-                    paudioReplyMsgHdr.msgTmp = 0x01;
-                    paudioReplyMsgHdr.msgVer = 1;
-                    paudioReplyMsgHdr.msgLen = sizeof(struct paudiodMsgHdr);
-                    paudioReplyMsgHdr.msgID = 0;
 
                     struct paReplyToPolicySet policySet;
+                    memset(&policySet, 0, sizeof(policySet));
                     policySet.Type = PAUDIOD_REPLY_MSGTYPE_SINK_CLOSE;
 
                     policySet.id = thelistitem->virtualsinkid;
@@ -3893,13 +3815,7 @@ static pa_hook_result_t route_sink_input_unlink_hook_callback(pa_core *c, pa_sin
                     strncpy(policySet.appName, thelistitem->appname, APP_NAME_LENGTH);
                     policySet.appName[APP_NAME_LENGTH - 1] = '\0';
 
-                    char *audiobuf = (char *)malloc(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToPolicySet));
-
-                    // copying....
-                    memcpy(audiobuf, &paudioReplyMsgHdr, sizeof(struct paudiodMsgHdr));
-                    memcpy(audiobuf + sizeof(struct paudiodMsgHdr), &policySet, sizeof(struct paReplyToPolicySet));
-
-                    if (-1 == send(u->newsockfd, audiobuf, SIZE_MESG_TO_AUDIOD, 0))
+                    if (!send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_POLICY, 0, &policySet, sizeof(policySet)))
                         pa_log_info("route_sink_input_unlink_hook_callback: send failed: %s", strerror(errno));
                     else
                         pa_log_info("route_sink_input_unlink_hook_callback: sending close notification to audiod");
@@ -3928,7 +3844,6 @@ static pa_hook_result_t
 route_sink_input_state_changed_hook_callback(pa_core *c, pa_sink_input *data, struct userdata *u)
 {
     pa_sink_input_state_t state;
-    char *audiodbuf = (char *)malloc(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToPolicySet));
     struct sinkinputnode *thelistitem = NULL;
 
     pa_assert(data);
@@ -3941,6 +3856,8 @@ route_sink_input_state_changed_hook_callback(pa_core *c, pa_sink_input *data, st
         if (thelistitem->sinkinput == data)
         {
             bool sinkidReversed = false;
+            struct paReplyToPolicySet policySet;
+            memset(&policySet, 0, sizeof(policySet));
 
             if (u->preprocess_module && thelistitem->virtualsinkid == -1 * u->PreprocessSinkId)
             {
@@ -3954,15 +3871,6 @@ route_sink_input_state_changed_hook_callback(pa_core *c, pa_sink_input *data, st
             if (!thelistitem->paused && state == PA_SINK_INPUT_CORKED)
             {
                 thelistitem->paused = true;
-                // added for message Type
-                struct paudiodMsgHdr paudioReplyMsgHdr;
-                paudioReplyMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_POLICY;
-                paudioReplyMsgHdr.msgTmp = 0x01;
-                paudioReplyMsgHdr.msgVer = 1;
-                paudioReplyMsgHdr.msgLen = sizeof(struct paudiodMsgHdr);
-                paudioReplyMsgHdr.msgID = 0;
-
-                struct paReplyToPolicySet policySet;
                 policySet.Type = PAUDIOD_REPLY_MSGTYPE_SINK_CLOSE;
 
                 policySet.id = thelistitem->virtualsinkid;
@@ -3970,10 +3878,6 @@ route_sink_input_state_changed_hook_callback(pa_core *c, pa_sink_input *data, st
                 strncpy(policySet.appName, thelistitem->appname, APP_NAME_LENGTH);
                 policySet.appName[APP_NAME_LENGTH - 1] = '\0';
 
-                // copying....
-                memcpy(audiodbuf, &paudioReplyMsgHdr, sizeof(struct paudiodMsgHdr));
-                memcpy(audiodbuf + sizeof(struct paudiodMsgHdr), &policySet, sizeof(struct paReplyToPolicySet));
-                // sprintf(audiodbuf, "c %d %d %s", thelistitem->virtualsinkid, thelistitem->sinkinputidx, thelistitem->appname);
 
                 // decrease sink opened count, even if audiod doesn't hear from it
                 if (thelistitem->virtualsinkid >= eVirtualSink_First && thelistitem->virtualsinkid <= eVirtualSink_Last)
@@ -3982,24 +3886,12 @@ route_sink_input_state_changed_hook_callback(pa_core *c, pa_sink_input *data, st
             else if (thelistitem->paused && state != PA_SINK_INPUT_CORKED)
             {
                 thelistitem->paused = false;
-                // added for message Type
-                struct paudiodMsgHdr paudioReplyMsgHdr;
-                paudioReplyMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_POLICY;
-                paudioReplyMsgHdr.msgTmp = 0x01;
-                paudioReplyMsgHdr.msgVer = 1;
-                paudioReplyMsgHdr.msgLen = sizeof(struct paudiodMsgHdr);
-                paudioReplyMsgHdr.msgID = 0;
-
-                struct paReplyToPolicySet policySet;
                 policySet.Type = PAUDIOD_REPLY_MSGTYPE_SINK_OPEN;
                 policySet.id = thelistitem->virtualsinkid;
                 policySet.index = thelistitem->sinkinputidx;
                 strncpy(policySet.appName, thelistitem->appname, APP_NAME_LENGTH);
                 policySet.appName[APP_NAME_LENGTH - 1] = '\0';
 
-                // copying....
-                memcpy(audiodbuf, &paudioReplyMsgHdr, sizeof(struct paudiodMsgHdr));
-                memcpy(audiodbuf + sizeof(struct paudiodMsgHdr), &policySet, sizeof(struct paReplyToPolicySet));
 
                 // increase sink opened count, even if audiod doesn't hear from it
                 if (thelistitem->virtualsinkid >= eVirtualSink_First && thelistitem->virtualsinkid <= eVirtualSink_Last)
@@ -4021,8 +3913,8 @@ route_sink_input_state_changed_hook_callback(pa_core *c, pa_sink_input *data, st
             /* notify audiod of stream closure */
             if (u->connectionactive && u->connev != NULL)
             {
-                if (-1 == send(u->newsockfd, audiodbuf, SIZE_MESG_TO_AUDIOD, 0))
-                    pa_log("route_sink_input_state_changed_hook_callback: send failed: %s", strerror(errno));
+                if (!send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_POLICY, 0, &policySet, sizeof(policySet)))
+                    pa_log("route_sink_input_state_changed_hook_callback: send failed");
                 else
                     pa_log_info("route_sink_input_state_changed_hook_callback: sending state change notification to audiod");
             }
@@ -4037,8 +3929,6 @@ static pa_hook_result_t route_source_output_state_changed_hook_callback(pa_core 
 
     pa_source_output_state_t state;
     struct sourceoutputnode *node;
-    char *audiobuf = (char *)malloc(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToPolicySet));
-    int ret;
 
     pa_assert(c);
     pa_assert(so);
@@ -4051,32 +3941,22 @@ static pa_hook_result_t route_source_output_state_changed_hook_callback(pa_core 
         if (node->sourceoutput == so)
         {
             bool sourceidReversed = false;
+            struct paReplyToPolicySet policySet;
+            memset(&policySet, 0, sizeof(policySet));
             if(u->preprocess_module && node->virtualsourceid == -1 * u->PreprocessSourceId)
             {
                 node->virtualsourceid = u->PreprocessSourceId;
                 sourceidReversed = true;
             }
 
-            if (node->paused && state == PA_SOURCE_OUTPUT_CORKED)
+            if (!node->paused && state == PA_SOURCE_OUTPUT_CORKED)
             {
-                // added for message Type
-                struct paudiodMsgHdr paudioReplyMsgHdr;
-                paudioReplyMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_POLICY;
-                paudioReplyMsgHdr.msgTmp = 0x01;
-                paudioReplyMsgHdr.msgVer = 1;
-                paudioReplyMsgHdr.msgLen = sizeof(struct paudiodMsgHdr);
-                paudioReplyMsgHdr.msgID = 0;
-
-                struct paReplyToPolicySet policySet;
                 policySet.Type = PAUDIOD_REPLY_MSGTYPE_SOURCE_CLOSE;
                 policySet.id = node->virtualsourceid;
                 policySet.index = node->sourceoutputidx;
                 strncpy(policySet.appName, node->appname, APP_NAME_LENGTH);
                 policySet.appName[APP_NAME_LENGTH - 1] = '\0';
 
-                // copying....
-                memcpy(audiobuf, &paudioReplyMsgHdr, sizeof(struct paudiodMsgHdr));
-                memcpy(audiobuf + sizeof(struct paudiodMsgHdr), &policySet, sizeof(struct paReplyToPolicySet));
                 node->paused = true;
 
                 /* decrease source opened count, even if audiod doesn't hear from it */
@@ -4087,24 +3967,12 @@ static pa_hook_result_t route_source_output_state_changed_hook_callback(pa_core 
             {
                 // pa_assert(node->paused == true);
                 node->paused = false;
-                // added for message Type
-                struct paudiodMsgHdr paudioReplyMsgHdr;
-                paudioReplyMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_POLICY;
-                paudioReplyMsgHdr.msgTmp = 0x01;
-                paudioReplyMsgHdr.msgVer = 1;
-                paudioReplyMsgHdr.msgLen = sizeof(struct paudiodMsgHdr);
-                paudioReplyMsgHdr.msgID = 0;
-
-                struct paReplyToPolicySet policySet;
                 policySet.Type = PAUDIOD_REPLY_MSGTYPE_SOURCE_OPEN;
                 policySet.id = node->virtualsourceid;
                 policySet.index = node->sourceoutputidx;
                 strncpy(policySet.appName, node->appname, APP_NAME_LENGTH);
                 policySet.appName[APP_NAME_LENGTH - 1] = '\0';
 
-                // copying....
-                memcpy(audiobuf, &paudioReplyMsgHdr, sizeof(struct paudiodMsgHdr));
-                memcpy(audiobuf + sizeof(struct paudiodMsgHdr), &policySet, sizeof(struct paReplyToPolicySet));
 
                 /* increase source opened count, even if audiod doesn't hear from it */
                 if (node->virtualsourceid >= eVirtualSource_First && node->virtualsourceid <= eVirtualSource_Last)
@@ -4122,9 +3990,8 @@ static pa_hook_result_t route_source_output_state_changed_hook_callback(pa_core 
             {
                 node->virtualsourceid *= -1;
             }
-            ret = send(u->newsockfd, audiobuf, SIZE_MESG_TO_AUDIOD, 0);
-            if (ret == -1)
-                pa_log("Error sending recording stream msg (%s)", audiobuf);
+            if (!send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_POLICY, 0, &policySet, sizeof(policySet)))
+                pa_log("Error sending recording stream state change to audiod");
             break;
         }
     }
@@ -4160,11 +4027,9 @@ static pa_hook_result_t route_source_output_unlink_hook_callback(pa_core *c, pa_
                 /* notify audiod of stream closure */
                 if (u->connectionactive && u->connev != NULL)
                 {
-                    // added for message Type
-                    struct paudiodMsgHdr paudioReplyMsgHdr;
-                    paudioReplyMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_POLICY;
 
                     struct paReplyToPolicySet policySet;
+                    memset(&policySet, 0, sizeof(policySet));
                     policySet.Type = PAUDIOD_REPLY_MSGTYPE_SOURCE_CLOSE;
 
                     policySet.id = thelistitem->virtualsourceid;
@@ -4172,15 +4037,8 @@ static pa_hook_result_t route_source_output_unlink_hook_callback(pa_core *c, pa_
                     strncpy(policySet.appName, thelistitem->appname, APP_NAME_LENGTH);
                     policySet.appName[APP_NAME_LENGTH - 1] = '\0';
 
-                    char *audiodbuf = (char *)malloc(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToPolicySet));
 
-                    // copying....
-                    memcpy(audiodbuf, &paudioReplyMsgHdr, sizeof(struct paudiodMsgHdr));
-                    memcpy(audiodbuf + sizeof(struct paudiodMsgHdr), &policySet, sizeof(struct paReplyToPolicySet));
-
-                    // sprintf(audiodbuf, "k %d %d %s", thelistitem->virtualsourceid, thelistitem->sourceoutputidx, thelistitem->appname);
-
-                    if (-1 == send(u->newsockfd, audiodbuf, SIZE_MESG_TO_AUDIOD, 0))
+                    if (!send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_POLICY, 0, &policySet, sizeof(policySet)))
                         pa_log("route_source_output_unlink_hook_callback: send failed: %s", strerror(errno));
                     else
                         pa_log_info("route_source_output_unlink_hook_callback: sending close notification to audiod");
@@ -4401,31 +4259,18 @@ pa_hook_result_t route_source_unlink_post_cb(pa_core *c, pa_source *source, stru
         /* notify audiod of device insertion */
         if (u->connectionactive && u->connev)
         {
-            // char audiobuf[SIZE_MESG_TO_AUDIOD];
             int ret = -1;
-            // added for message Type
-            struct paudiodMsgHdr paudioReplyMsgHdr;
-            paudioReplyMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_ROUTING;
-            paudioReplyMsgHdr.msgTmp = 0x01;
-            paudioReplyMsgHdr.msgVer = 1;
-            paudioReplyMsgHdr.msgLen = sizeof(struct paudiodMsgHdr);
-            paudioReplyMsgHdr.msgID = 0;
 
             struct paReplyToRoutingSet routingSet;
+            memset(&routingSet, 0, sizeof(routingSet));
             routingSet.Type = PAUDIOD_REPLY_MSGTYPE_DEVICE_REMOVED;
             routingSet.isOutput = 0;
             strncpy(routingSet.device, u->callback_deviceName, 50);
             routingSet.deviceIcon[0] = '\0';
             routingSet.deviceNameDetail[0] = '\0';
 
-            char *audiobuf = (char *)malloc(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToRoutingSet));
-
-            // copying....
-            memcpy(audiobuf, &paudioReplyMsgHdr, sizeof(struct paudiodMsgHdr));
-            memcpy(audiobuf + sizeof(struct paudiodMsgHdr), &routingSet, sizeof(struct paReplyToRoutingSet));
             /* we have a connection send a message to audioD */
-            pa_log_info("payload:%s", audiobuf);
-            ret = send(u->newsockfd, audiobuf, SIZE_MESG_TO_AUDIOD, 0);
+            ret = send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_ROUTING, 0, &routingSet, sizeof(routingSet)) ? 0 : -1;
             if (-1 == ret)
                 pa_log("send() failed: %s", strerror(errno));
             else
@@ -4460,18 +4305,11 @@ pa_hook_result_t route_sink_unlink_cb(pa_core *c, pa_sink *sink, struct userdata
             /* notify audiod of device insertion */
             if (u->connectionactive && u->connev)
             {
-                // char audiobuf[SIZE_MESG_TO_AUDIOD];
                 int ret = -1;
                 /* we have a connection send a message to audioD */
-                // added for message Type
-                struct paudiodMsgHdr paudioReplyMsgHdr;
-                paudioReplyMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_ROUTING;
-                paudioReplyMsgHdr.msgTmp = 0x01;
-                paudioReplyMsgHdr.msgVer = 1;
-                paudioReplyMsgHdr.msgLen = sizeof(struct paudiodMsgHdr);
-                paudioReplyMsgHdr.msgID = 0;
 
                 struct paReplyToRoutingSet routingSet;
+                memset(&routingSet, 0, sizeof(routingSet));
                 routingSet.Type = PAUDIOD_REPLY_MSGTYPE_DEVICE_REMOVED;
                 routingSet.isOutput = 1;
                 routingSet.deviceIcon[0] = '\0';
@@ -4479,14 +4317,7 @@ pa_hook_result_t route_sink_unlink_cb(pa_core *c, pa_sink *sink, struct userdata
 
                 strncpy(routingSet.device, u->callback_deviceName, 50);
 
-                char *audiobuf = (char *)malloc(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToRoutingSet));
-
-                // copying....
-                memcpy(audiobuf, &paudioReplyMsgHdr, sizeof(struct paudiodMsgHdr));
-                memcpy(audiobuf + sizeof(struct paudiodMsgHdr), &routingSet, sizeof(struct paReplyToRoutingSet));
-
-                pa_log_info("payload:%s", audiobuf);
-                ret = send(u->newsockfd, audiobuf, SIZE_MESG_TO_AUDIOD, 0);
+                ret = send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_ROUTING, 0, &routingSet, sizeof(routingSet)) ? 0 : -1;
                 if (-1 == ret)
                     pa_log("send() failed: %s", strerror(errno));
                 else
@@ -4511,32 +4342,19 @@ pa_hook_result_t route_sink_unlink_cb(pa_core *c, pa_sink *sink, struct userdata
             /* notify audiod of device removal */
             if (u->connectionactive && u->connev)
             {
-                // char audiobuf[SIZE_MESG_TO_AUDIOD];
                 int ret = -1;
-                // added for message Type
-                struct paudiodMsgHdr paudioReplyMsgHdr;
-                paudioReplyMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_ROUTING;
-                paudioReplyMsgHdr.msgTmp = 0x01;
-                paudioReplyMsgHdr.msgVer = 1;
-                paudioReplyMsgHdr.msgLen = sizeof(struct paudiodMsgHdr);
-                paudioReplyMsgHdr.msgID = 0;
 
                 struct paReplyToRoutingSet routingSet;
+                memset(&routingSet, 0, sizeof(routingSet));
                 routingSet.Type = PAUDIOD_REPLY_MSGTYPE_DEVICE_REMOVED;
                 routingSet.isOutput = 1;
                 routingSet.deviceIcon[0] = '\0';
                 routingSet.deviceNameDetail[0] = '\0';
                 strncpy(routingSet.device, u->callback_deviceName, 50);
 
-                char *audiobuf = (char *)malloc(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToRoutingSet));
-
-                // copying....
-                memcpy(audiobuf, &paudioReplyMsgHdr, sizeof(struct paudiodMsgHdr));
-                memcpy(audiobuf + sizeof(struct paudiodMsgHdr), &routingSet, sizeof(struct paReplyToRoutingSet));
                 /* we have a connection send a message to audioD */
 
-                pa_log_info("payload:%s", audiobuf);
-                ret = send(u->newsockfd, audiobuf, SIZE_MESG_TO_AUDIOD, 0);
+                ret = send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_ROUTING, 0, &routingSet, sizeof(routingSet)) ? 0 : -1;
                 if (-1 == ret)
                     pa_log("send() failed: %s", strerror(errno));
                 else
@@ -4567,17 +4385,10 @@ static pa_hook_result_t source_load_subscription_callback(pa_core *c, pa_source_
         /* notify audiod of device insertion */
         if (u->connectionactive && u->connev)
         {
-            // char audiobuf[SIZE_MESG_TO_AUDIOD];
             int ret = -1;
-            // added for message Type
-            struct paudiodMsgHdr paudioReplyMsgHdr;
-            paudioReplyMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_ROUTING;
-            paudioReplyMsgHdr.msgTmp = 0x01;
-            paudioReplyMsgHdr.msgVer = 1;
-            paudioReplyMsgHdr.msgLen = sizeof(struct paudiodMsgHdr);
-            paudioReplyMsgHdr.msgID = 0;
 
             struct paReplyToRoutingSet routingSet;
+            memset(&routingSet, 0, sizeof(routingSet));
             routingSet.Type = PAUDIOD_REPLY_MSGTYPE_DEVICE_CONNECTION;
             strncpy(routingSet.device, u->callback_deviceName, 50);
             strncpy(routingSet.deviceNameDetail, deviceNameDetail, 50);
@@ -4585,13 +4396,8 @@ static pa_hook_result_t source_load_subscription_callback(pa_core *c, pa_source_
             routingSet.isOutput = 0; // false
             routingSet.deviceNameDetail[49] = 0;
 
-            char *audiobuf = (char *)malloc(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToRoutingSet));
-            // copying....
-            memcpy(audiobuf, &paudioReplyMsgHdr, sizeof(struct paudiodMsgHdr));
-            memcpy(audiobuf + sizeof(struct paudiodMsgHdr), &routingSet, sizeof(struct paReplyToRoutingSet));
             /* we have a connection send a message to audioD */
-            pa_log_info("payload:%s", audiobuf);
-            ret = send(u->newsockfd, audiobuf, SIZE_MESG_TO_AUDIOD, 0);
+            ret = send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_ROUTING, 0, &routingSet, sizeof(routingSet)) ? 0 : -1;
             if (-1 == ret)
                 pa_log("send() failed: %s", strerror(errno));
             else
@@ -4629,17 +4435,10 @@ pa_hook_result_t sink_load_subscription_callback(pa_core *c, pa_sink_new_data *d
             /* notify audiod of device insertion */
             if (u->connectionactive && u->connev)
             {
-                // char audiobuf[SIZE_MESG_TO_AUDIOD];
                 int ret = -1;
-                // added for message Type
-                struct paudiodMsgHdr paudioReplyMsgHdr;
-                paudioReplyMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_ROUTING;
-                paudioReplyMsgHdr.msgTmp = 0x01;
-                paudioReplyMsgHdr.msgVer = 1;
-                paudioReplyMsgHdr.msgLen = sizeof(struct paudiodMsgHdr);
-                paudioReplyMsgHdr.msgID = 0;
 
                 struct paReplyToRoutingSet routingSet;
+                memset(&routingSet, 0, sizeof(routingSet));
                 routingSet.Type = PAUDIOD_REPLY_MSGTYPE_DEVICE_CONNECTION;
                 strncpy(routingSet.device, u->callback_deviceName, 50);
                 strncpy(routingSet.deviceNameDetail, deviceNameDetail, 50);
@@ -4647,14 +4446,8 @@ pa_hook_result_t sink_load_subscription_callback(pa_core *c, pa_sink_new_data *d
                 routingSet.isOutput = 1; // true
                 routingSet.deviceNameDetail[49] = 0;
 
-                char *audiobuf = (char *)malloc(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToRoutingSet));
-                // copying....
-                memcpy(audiobuf, &paudioReplyMsgHdr, sizeof(struct paudiodMsgHdr));
-                memcpy(audiobuf + sizeof(struct paudiodMsgHdr), &routingSet, sizeof(struct paReplyToRoutingSet));
                 /* we have a connection send a message to audioD */
-                // sprintf(audiobuf, "%c %s %s", 'i', u->callback_deviceName, deviceNameDetail);
-                pa_log_info("payload:%s", audiobuf);
-                ret = send(u->newsockfd, audiobuf, SIZE_MESG_TO_AUDIOD, 0);
+                ret = send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_ROUTING, 0, &routingSet, sizeof(routingSet)) ? 0 : -1;
                 if (-1 == ret)
                     pa_log("send() failed: %s", strerror(errno));
                 else
@@ -4682,17 +4475,10 @@ pa_hook_result_t sink_load_subscription_callback(pa_core *c, pa_sink_new_data *d
             /* notify audiod of device insertion */
             if (u->connectionactive && u->connev)
             {
-                // char audiobuf[SIZE_MESG_TO_AUDIOD];
                 int ret = -1;
-                // added for message Type
-                struct paudiodMsgHdr paudioReplyMsgHdr;
-                paudioReplyMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_ROUTING;
-                paudioReplyMsgHdr.msgTmp = 0x01;
-                paudioReplyMsgHdr.msgVer = 1;
-                paudioReplyMsgHdr.msgLen = sizeof(struct paudiodMsgHdr);
-                paudioReplyMsgHdr.msgID = 0;
 
                 struct paReplyToRoutingSet routingSet;
+                memset(&routingSet, 0, sizeof(routingSet));
                 routingSet.Type = PAUDIOD_REPLY_MSGTYPE_DEVICE_CONNECTION;
                 strncpy(routingSet.device, u->callback_deviceName, 50);
                 strncpy(routingSet.deviceNameDetail, deviceNameDetail, 50);
@@ -4700,13 +4486,8 @@ pa_hook_result_t sink_load_subscription_callback(pa_core *c, pa_sink_new_data *d
                 routingSet.deviceNameDetail[49] = 0;
                 routingSet.isOutput = 1; // true
 
-                char *audiobuf = (char *)malloc(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToRoutingSet));
-                // copying....
-                memcpy(audiobuf, &paudioReplyMsgHdr, sizeof(struct paudiodMsgHdr));
-                memcpy(audiobuf + sizeof(struct paudiodMsgHdr), &routingSet, sizeof(struct paReplyToRoutingSet));
                 /* we have a connection send a message to audioD */
-                pa_log_info("payload:%s", audiobuf);
-                ret = send(u->newsockfd, audiobuf, SIZE_MESG_TO_AUDIOD, 0);
+                ret = send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_ROUTING, 0, &routingSet, sizeof(routingSet)) ? 0 : -1;
                 if (-1 == ret)
                     pa_log("send() failed: %s", strerror(errno));
                 else
