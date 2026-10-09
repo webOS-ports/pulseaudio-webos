@@ -581,7 +581,7 @@ bool init_multiple_usb_device_info(struct userdata *u, bool isOutput, int maxDev
 
     // calculate memory size
     int baseNameSize = strlen(baseName) * sizeof(char) + 1;
-    pa_log_debug("%s, memory size for base name:%d, memory size for device list:%d", __FUNCTION__, baseNameSize, (sizeof(deviceInfo) * mdi->maxDeviceCount));
+    pa_log_debug("%s, memory size for base name:%d, memory size for device list:%zu", __FUNCTION__, baseNameSize, (sizeof(deviceInfo) * (size_t)mdi->maxDeviceCount));
 
     // allocate memory
     mdi->baseName = (char *)pa_xmalloc0(baseNameSize);
@@ -1592,7 +1592,7 @@ static bool source_set_master_mute(const char *source, bool mute, struct userdat
             pa_source_set_mute(destSource, UNMUTE, SAVE);
     }
     else
-        pa_log("Valid source is not present for source ID %d ", source);
+        pa_log("Valid source is not present for source %s", source);
     return true;
 }
 
@@ -1967,12 +1967,12 @@ static bool load_lineout_alsa_sink(struct userdata *u, int soundcardNo, int devi
                 deviceList->cardNumber = soundcardNo;
                 deviceList->deviceNumber = deviceNo;
                 deviceList->index = i;
-                pa_log("%s, %s,%s,%d", __FUNCTION__, u->deviceName, deviceList->cardName, strlen(u->deviceName));
+                pa_log("%s, %s,%s,%zu", __FUNCTION__, u->deviceName, deviceList->cardName, strlen(u->deviceName));
                 strncpy(deviceList->cardName, u->deviceName, SINK_NAME_LENGTH);
                 free(deviceList->cardNameDetail);
                 deviceList->cardNameDetail = NULL;
                 snd_card_get_name(soundcardNo, &(deviceList->cardNameDetail));
-                pa_log_info("lineout %s:%s - %d", deviceList->cardName, deviceList->cardNameDetail, strlen(deviceList->cardName));
+                pa_log_info("lineout %s:%s - %zu", deviceList->cardName, deviceList->cardNameDetail, strlen(deviceList->cardName));
 
                 args = pa_sprintf_malloc("device=hw:%d,%d mmap=0 sink_name=%s fragment_size=4096 tsched=0", soundcardNo, deviceNo, u->deviceName);
                 pa_module_load(&deviceList->alsaModule, u->core, "module-alsa-sink", args);
@@ -2643,7 +2643,7 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
             u->connectionPort = SndHdr->port;
             strncpy(u->connectionType,SndHdr->device,50);// = "to fix incompatible pointer type";
             pa_log_info("received rtp load cmd from Audiod");
-            pa_log_info("parse_message:received command t FOR RTP module port = %lu", u->connectionPort);
+            pa_log_info("parse_message:received command t FOR RTP module port = %d", u->connectionPort);
             if (strcmp(u->connectionType, "unicast") == 0)
             {
                 ret = load_unicast_rtp_module(u);
