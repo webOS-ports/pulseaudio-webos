@@ -359,7 +359,6 @@ static bool virtual_source_set_mute(int sourceid, int mute, struct userdata *u);
 
 static bool virtual_source_input_set_volume(int sinkid, int volumetoset, int volumetable, struct userdata *u);
 
-static void virtual_source_input_set_volume_with_ramp(int sourceId, int volumetoset, int volumetable, struct userdata *u);
 
 static void virtual_source_input_index_set_volume(int sourceId, int index, int volumetoset, int volumetable, struct userdata *u);
 
@@ -438,14 +437,9 @@ static pa_hook_result_t route_source_output_state_changed_hook_callback(pa_core 
 static pa_hook_result_t route_source_output_unlink_hook_callback(pa_core *c, pa_source_output *data,
                                                                  struct userdata *u);
 
-static pa_hook_result_t route_sink_state_changed_hook_callback(pa_core *c, pa_object *o,
-                                                               struct userdata *u);
 
-static bool sink_input_new_data_is_passthrough(pa_sink_input_new_data *data);
 
-static pa_hook_result_t sink_state_changed_cb(pa_core *c, pa_object *o, struct userdata *u);
 
-static pa_hook_result_t source_state_changed_cb(pa_core *c, pa_object *o, struct userdata *u);
 
 static bool set_source_inputdevice(struct userdata *u, char *inputdevice, int sourceId);
 
@@ -459,7 +453,17 @@ static bool set_default_sink_routing(struct userdata *u, int startsinkid, int en
 
 static bool set_default_source_routing(struct userdata *u, int startsourceid, int endsourceid);
 
-bool detect_usb_device(struct userdata *u, bool isOutput, int cardNumber, int deviceNumber, bool status);
+static bool detect_usb_device(struct userdata *u, bool isOutput, int cardNumber, int deviceNumber, bool status);
+
+/* The module's entry points. An in-tree build declares them in a generated
+ * symdef header; this one is built on its own. */
+const char *pa__get_author(void);
+const char *pa__get_description(void);
+const char *pa__get_version(void);
+bool pa__load_once(void);
+const char *pa__get_usage(void);
+int pa__init(pa_module *m);
+void pa__done(pa_module *m);
 
 PA_MODULE_AUTHOR("Palm, Inc.");
 PA_MODULE_DESCRIPTION("Implements policy, communication with external app is a socket at /tmp/palmaudio");
@@ -514,7 +518,7 @@ static void device_list_free(multipleDeviceInfo *mdi)
     mdi->maxDeviceCount = 0;
 }
 
-bool initialise_internal_card(struct userdata *u, int maxDeviceCount, int isOutput)
+static bool initialise_internal_card(struct userdata *u, int maxDeviceCount, int isOutput)
 {
     pa_assert(u);
     pa_assert(u->internalInputDeviceInfo);
@@ -544,7 +548,7 @@ bool initialise_internal_card(struct userdata *u, int maxDeviceCount, int isOutp
     return true;
 }
 
-bool init_multiple_usb_device_info(struct userdata *u, bool isOutput, int maxDeviceCount, char *baseName)
+static bool init_multiple_usb_device_info(struct userdata *u, bool isOutput, int maxDeviceCount, char *baseName)
 {
     pa_assert(u);
     pa_assert(u->usbOutputDeviceInfo);
@@ -609,7 +613,7 @@ bool init_multiple_usb_device_info(struct userdata *u, bool isOutput, int maxDev
     return true;
 }
 
-int get_usb_device_index(multipleDeviceInfo *mdi, int cardNumber, int deviceNumber)
+static int get_usb_device_index(multipleDeviceInfo *mdi, int cardNumber, int deviceNumber)
 {
     pa_assert(mdi);
     pa_assert(mdi->deviceList);
@@ -629,7 +633,7 @@ int get_usb_device_index(multipleDeviceInfo *mdi, int cardNumber, int deviceNumb
     return -1;
 }
 
-int get_new_usb_device_index(multipleDeviceInfo *mdi, int cardNumber, int deviceNumber)
+static int get_new_usb_device_index(multipleDeviceInfo *mdi, int cardNumber, int deviceNumber)
 {
     pa_assert(mdi);
     pa_assert(mdi->deviceList);
@@ -654,7 +658,7 @@ int get_new_usb_device_index(multipleDeviceInfo *mdi, int cardNumber, int device
     return -1;
 }
 
-bool check_multiple_usb_device_info_initialization(multipleDeviceInfo *mdi)
+static bool check_multiple_usb_device_info_initialization(multipleDeviceInfo *mdi)
 {
     pa_assert(mdi);
 
@@ -665,7 +669,7 @@ bool check_multiple_usb_device_info_initialization(multipleDeviceInfo *mdi)
     return true;
 }
 
-void print_device_info(bool isOutput, multipleDeviceInfo *mdi)
+static void print_device_info(bool isOutput, multipleDeviceInfo *mdi)
 {
     pa_assert(mdi);
 
@@ -686,7 +690,7 @@ void print_device_info(bool isOutput, multipleDeviceInfo *mdi)
     }
 }
 
-bool detect_usb_device(struct userdata *u, bool isOutput, int cardNumber, int deviceNumber, bool status)
+static bool detect_usb_device(struct userdata *u, bool isOutput, int cardNumber, int deviceNumber, bool status)
 {
     pa_assert(u);
     pa_assert(u->usbOutputDeviceInfo);
@@ -760,7 +764,7 @@ bool detect_usb_device(struct userdata *u, bool isOutput, int cardNumber, int de
     return true;
 }
 
-const char *get_device_name_from_detail(const char *deviceDetail, struct userdata *u, bool isOutput)
+static const char *get_device_name_from_detail(const char *deviceDetail, struct userdata *u, bool isOutput)
 {
     pa_log_debug("%s, deviceDetail:%s stream", __FUNCTION__, deviceDetail);
     if (isOutput)
@@ -820,7 +824,7 @@ const char *get_device_name_from_detail(const char *deviceDetail, struct userdat
     return deviceDetail;
 }
 
-void find_and_load_usb_devices(struct userdata *u, const char *deviceName, snd_pcm_stream_t stream)
+static void find_and_load_usb_devices(struct userdata *u, const char *deviceName, snd_pcm_stream_t stream)
 {
     pa_assert(u);
     pa_assert(deviceName);
@@ -902,7 +906,7 @@ void find_and_load_usb_devices(struct userdata *u, const char *deviceName, snd_p
     }
 }
 
-void initialize_usb_devices(struct userdata *u, bool isOutput)
+static void initialize_usb_devices(struct userdata *u, bool isOutput)
 {
     pa_assert(u);
     pa_log_info("%s, is output:%d", __FUNCTION__, isOutput);
@@ -910,7 +914,7 @@ void initialize_usb_devices(struct userdata *u, bool isOutput)
     find_and_load_usb_devices(u, "USB Audio", isOutput ? SND_PCM_STREAM_PLAYBACK : SND_PCM_STREAM_CAPTURE);
 }
 
-void check_and_remove_usb_device_module(struct userdata *u, bool isOutput, pa_module *m)
+static void check_and_remove_usb_device_module(struct userdata *u, bool isOutput, pa_module *m)
 {
     pa_assert(u);
     pa_assert(u->usbOutputDeviceInfo);
@@ -941,25 +945,6 @@ void check_and_remove_usb_device_module(struct userdata *u, bool isOutput, pa_mo
 /* When headset is connected to Rpi,audio will be routed to headset.
 Once it is removed, audio will be routed to HDMI.
 */
-
-static bool sink_input_new_data_is_passthrough(pa_sink_input_new_data *data)
-{
-
-    if (pa_sink_input_new_data_is_passthrough(data))
-        return true;
-    else
-    {
-        pa_format_info *f = NULL;
-        uint32_t idx = 0;
-
-        PA_IDXSET_FOREACH(f, data->req_formats, idx)
-        {
-            if (!pa_format_info_is_pcm(f))
-                return true;
-        }
-    }
-    return false;
-}
 
 // To set the physical source(input device) for single virtual source
 static bool set_source_inputdevice(struct userdata *u, char *inputdevice, int sourceId)
@@ -1239,7 +1224,7 @@ static bool virtual_sink_input_set_ramp_volume(int sinkid, int volumetoset, int 
     if (!volume_in_range(volumetable, volumetoset))
         return false;
     struct sinkinputnode *thelistitem = NULL;
-    struct pa_cvolume cvolume, orig_cvolume;
+    struct pa_cvolume cvolume;
 
     if (sinkid >= 0 && sinkid < eVirtualSink_Count)
     {
@@ -1253,7 +1238,6 @@ static bool virtual_sink_input_set_ramp_volume(int sinkid, int volumetoset, int 
             {
                 if (!pa_sink_input_is_passthrough(thelistitem->sinkinput))
                 {
-                    pa_usec_t msec;
                     u->sink_mapping_table[sinkid].volumetable = volumetable;
                     pa_log_debug("volume we are setting is %u, %f db",
                                  pa_sw_volume_from_dB(_mapPercentToPulseRamp
@@ -1264,13 +1248,9 @@ static bool virtual_sink_input_set_ramp_volume(int sinkid, int volumetoset, int 
                                    pa_sw_volume_from_dB(_mapPercentToPulseRamp[volumetable]
                                                                               [volumetoset]));
 
-                    if (pa_cvolume_max(&cvolume) >=
-                        pa_cvolume_max(pa_sink_input_get_volume(thelistitem->sinkinput, &orig_cvolume, TRUE)))
-                        msec = PALM_UP_RAMP_MSEC;
-                    else
-                        msec = PALM_DOWN_RAMP_MSEC;
-
-                    /* pa_sink_input_set_volume_with_ramping(thelistitem->sinkinput, &cvolume, TRUE, TRUE, msec * PA_USEC_PER_MSEC); */
+                    /* LG's fork ramps this (PALM_UP/DOWN_RAMP_MSEC); upstream
+                     * PulseAudio has no ramped sink input volume, so it is set
+                     * directly. */
                     if (thelistitem->sinkinput->volume_writable)
                         pa_sink_input_set_volume(thelistitem->sinkinput, &cvolume, TRUE, TRUE);
                     else
@@ -1335,7 +1315,7 @@ static bool virtual_sink_input_set_volume(int sinkid, int volumetoset, int volum
     return true;
 }
 
-bool close_playback_by_sink_input(int sinkInputIndex, struct userdata *u)
+static bool close_playback_by_sink_input(int sinkInputIndex, struct userdata *u)
 {
     struct sinkinputnode *thelistitem = NULL;
     pa_log_info("close_playback_by_sink_input close client associated with sinkinput index %d", sinkInputIndex);
@@ -1590,7 +1570,6 @@ static bool source_set_master_mute(const char *source, bool mute, struct userdat
 {
     pa_log_debug("Inside source_set_master_mute with source %s and mute %d", source, mute);
     pa_assert(u);
-    char *sourcename;
     pa_source *destSource = NULL;
     destSource = pa_namereg_get(u->core, source, PA_NAMEREG_SOURCE);
     if (NULL != destSource)
@@ -1639,6 +1618,8 @@ static int sink_suspend_request(struct userdata *u)
 
 static int update_sample_spec(struct userdata *u, int rate)
 {
+    (void)u; /* the body is disabled below */
+    (void)rate;
 #if 0
     pa_sink *sink;
     pa_source *source;
@@ -1752,55 +1733,6 @@ static bool load_unicast_rtp_module(struct userdata *u)
     return true;
 }
 
-static void load_alsa_source(struct userdata *u, int status)
-{
-    pa_assert(u);
-    char *args = NULL;
-
-    pa_log("[alsa source loading begins for Mic Recording] [AudioD sent] cardno = %d capture device number = %d",
-           u->external_soundcard_number, u->external_device_number);
-    if (u->alsa_source != NULL)
-    {
-        pa_module_unload(u->alsa_source, true);
-        u->alsa_source = NULL;
-    }
-    if (u->external_soundcard_number >= 0 && (1 == status))
-    {
-        args = pa_sprintf_malloc("device=hw:%d,%d mmap=0 source_name=%s fragment_size=4096 tsched=0",
-                                 u->external_soundcard_number, u->external_device_number, u->deviceName);
-    }
-    else if (0 == status)
-    {
-        struct stat buff = {0};
-        // Loading source on card 0.
-        if (0 == stat(DEFAULT_SOURCE_0, &buff))
-        {
-            args = pa_sprintf_malloc("device=hw:0,0 mmap=0 source_name=%s fragment_size=4096 tsched=0", u->deviceName);
-        }
-        // Loading source on card 1.
-        else if (0 == stat(DEFAULT_SOURCE_1, &buff))
-        {
-            args = pa_sprintf_malloc("device=hw:1,0 mmap=0 source_name=%s fragment_size=4096 tsched=0", u->deviceName);
-        }
-        else
-            pa_log_info("No source element found to load");
-    }
-    else
-        return;
-    if (NULL != args)
-        pa_module_load(&u->alsa_source, u->core, "module-alsa-source", args);
-
-    if (args)
-        pa_xfree(args);
-
-    if (!u->alsa_source)
-    {
-        pa_log("Error loading in module-alsa-source");
-        return;
-    }
-    pa_log_info("module-alsa-source loaded");
-}
-
 static bool load_multicast_rtp_module(struct userdata *u)
 {
     char *args = NULL;
@@ -1875,7 +1807,7 @@ static bool unload_rtp_module(struct userdata *u)
     return true;
 }
 
-void send_rtp_connection_data_to_audiod(const char *ip, const char *port, struct userdata *u)
+static void send_rtp_connection_data_to_audiod(const char *ip, const char *port, struct userdata *u)
 {
     pa_assert(ip);
     pa_assert(port);
@@ -1952,8 +1884,8 @@ static bool unload_BlueTooth_module(struct userdata *u)
 
 static bool load_lineout_alsa_sink(struct userdata *u, int soundcardNo, int deviceNo, int status, int isOutput)
 {
+    (void)status;
     pa_assert(u);
-    int sink = 0;
     /* Request for lineout loading
      * Load Alsa Sink Module
      * Send Error To AudioD in case Alsa sink Load fails
@@ -2279,7 +2211,7 @@ static bool set_equalizer_param(struct userdata *u, int preset, int band, int le
     return true;
 }
 
-void send_callback_to_audiod(int id, int returnVal, struct userdata *u)
+static void send_callback_to_audiod(int id, int returnVal, struct userdata *u)
 {
     pa_log_info("%s : %d,%d", __FUNCTION__, id, returnVal);
 
@@ -2319,9 +2251,6 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
     struct paudiodMsgHdr *msgHdr = (struct paudiodMsgHdr *)msgbuf;
     pa_log_info("parse_message: message type=%x, message ID=%x", msgHdr->msgType, msgHdr->msgID);
 
-    int param1, param2, param3;
-    int sinkid;
-    int sourceid;
     int ret;
 
     switch (msgHdr->msgType)
@@ -2332,9 +2261,6 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
         struct paRoutingSet *SndHdr = (struct paRoutingSet *)(msgbuf + HdrLen);
         /* the strings come off the wire: never read past their fields */
         SndHdr->device[sizeof(SndHdr->device) - 1] = '\0';
-        char device[DEVICE_NAME_LENGTH];
-        int startID;
-        int endID;
         pa_log_info("received source routing for device:%s startID:%d,\
                 endID:%d",
                     SndHdr->device, SndHdr->startID, SndHdr->endID);
@@ -2561,11 +2487,6 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
         struct paDeviceSet *SndHdr = (struct paDeviceSet *)(msgbuf + HdrLen);
         /* the strings come off the wire: never read past their fields */
         SndHdr->device[sizeof(SndHdr->device) - 1] = '\0';
-        int status = 0;
-        int cardNo;
-        int deviceNo;
-        char devicename[50];
-        int isOutput;
         pa_log_info("received lineout loading cmd from Audiod  cardno:%d,deviceno:%d,status:%d,isoutput:%d,name: %s",
                     SndHdr->cardNo, SndHdr->deviceNo, SndHdr->status, SndHdr->isOutput, u->deviceName);
         switch (SndHdr->Type)
@@ -2726,7 +2647,6 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
         case PAUDIOD_SETPARAM_CLOSE_PLAYBACK:
         {
             // '7'
-            int sinkIndex;
             ret = close_playback_by_sink_input(SndHdr->ID, u);
             send_callback_to_audiod(msgHdr->msgID, ret, u);
         }
@@ -2746,8 +2666,7 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
         case PAUDIOD_EFFECT_SPEECH_ENHANCEMENT_LOAD:
         {
             // '4'
-            uint32_t effectId, enabled;
-            effectId = SndHdr->id;
+            uint32_t enabled;
             enabled = SndHdr->param[0];
             ret = set_audio_effect(u, "speech_enhancement", enabled);
             send_callback_to_audiod(msgHdr->msgID, ret, u);
@@ -2755,8 +2674,7 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
         break;
         case PAUDIOD_EFFECT_GAIN_CONTROL_LOAD:
         {
-            uint32_t effectId, enabled;
-            effectId = SndHdr->id;
+            uint32_t enabled;
             enabled = SndHdr->param[0];
             ret = set_audio_effect(u, "gain_control", enabled);
             send_callback_to_audiod(msgHdr->msgID, ret, u);
@@ -2764,8 +2682,7 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
         break;
         case PAUDIOD_EFFECT_BEAMFORMING_LOAD:
         {
-            uint32_t effectId, enabled;
-            effectId = SndHdr->id;
+            uint32_t enabled;
             enabled = SndHdr->param[0];
             ret = set_audio_effect(u, "beamforming", enabled);
             send_callback_to_audiod(msgHdr->msgID, ret, u);
@@ -2773,8 +2690,7 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
         break;
         case PAUDIOD_EFFECT_DYNAMIC_COMPRESSOR_LOAD:
         {
-            uint32_t effectId, enabled;
-            effectId = SndHdr->id;
+            uint32_t enabled;
             enabled = SndHdr->param[0];
             ret = set_postprocess_effect(u, "dynamic_range_compressor", enabled);
             send_callback_to_audiod(msgHdr->msgID, ret, u);
@@ -2782,8 +2698,7 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
         break;
         case PAUDIOD_EFFECT_EQUALIZER_LOAD:
         {
-            uint32_t effectId, enabled;
-            effectId = SndHdr->id;
+            uint32_t enabled;
             enabled = SndHdr->param[0];
             ret = set_postprocess_effect(u, "equalizer", enabled);
             send_callback_to_audiod(msgHdr->msgID, ret, u);
@@ -2801,8 +2716,7 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
         break;
         case PAUDIOD_EFFECT_BASS_BOOST_LOAD:
         {
-            uint32_t effectId, enabled;
-            effectId = SndHdr->id;
+            uint32_t enabled;
             enabled = SndHdr->param[0];
             ret = set_postprocess_effect(u, "bass_boost", enabled);
             send_callback_to_audiod(msgHdr->msgID, ret, u);
@@ -2825,6 +2739,8 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
  * appropriate IO event handler */
 static void handle_io_event_socket(pa_mainloop_api *ea, pa_io_event *e, int fd, pa_io_event_flags_t events, void *userdata)
 {
+    (void)ea;
+    (void)e;
     struct userdata *u = userdata;
     struct sockaddr_un peer;
     socklen_t peerlen = sizeof(peer);
@@ -2933,6 +2849,8 @@ static void close_connection(struct userdata *u)
 
 static void handle_io_event_connection(pa_mainloop_api *ea, pa_io_event *e, int fd, pa_io_event_flags_t events, void *userdata)
 {
+    (void)ea;
+    (void)e;
     struct userdata *u = userdata;
     ssize_t bytesread;
 
@@ -3611,7 +3529,6 @@ static pa_hook_result_t route_source_output_new_hook_callback(pa_core *c, pa_sou
 {
     int i, source_index = erecord;
     pa_proplist *stream_type;
-    pa_proplist *a;
     pa_source *source;
     const char *port, *dest_ip, *prop_name;
     pa_assert(data);
@@ -3908,6 +3825,7 @@ static pa_hook_result_t route_source_output_put_hook_callback(pa_core *c, pa_sou
 /* callback for stream deletion */
 static pa_hook_result_t route_sink_input_unlink_hook_callback(pa_core *c, pa_sink_input *data, struct userdata *u)
 {
+    (void)c;
     struct sinkinputnode *thelistitem = NULL;
 
     pa_assert(data);
@@ -3920,11 +3838,9 @@ static pa_hook_result_t route_sink_input_unlink_hook_callback(pa_core *c, pa_sin
         if (thelistitem->sinkinput == data)
         {
 
-            bool sinkidReversed = false;
             if (u->preprocess_module && thelistitem->virtualsinkid == -1 * u->PreprocessSinkId)
             {
                 thelistitem->virtualsinkid = u->PreprocessSinkId;
-                sinkidReversed = true;
             }
             /* we have a connection send a message to audioD */
             if (!thelistitem->paused)
@@ -3973,6 +3889,7 @@ static pa_hook_result_t route_sink_input_unlink_hook_callback(pa_core *c, pa_sin
 static pa_hook_result_t
 route_sink_input_state_changed_hook_callback(pa_core *c, pa_sink_input *data, struct userdata *u)
 {
+    (void)c;
     pa_sink_input_state_t state;
     struct sinkinputnode *thelistitem = NULL;
 
@@ -4140,11 +4057,9 @@ static pa_hook_result_t route_source_output_unlink_hook_callback(pa_core *c, pa_
         if (thelistitem->sourceoutput == data)
         {
 
-            bool sourceidReversed = false;
             if (u->preprocess_module && thelistitem->virtualsourceid == -1 * u->PreprocessSourceId)
             {
                 thelistitem->virtualsourceid = u->PreprocessSourceId;
-                sourceidReversed = true;
             }
 
             if (!thelistitem->paused)
@@ -4395,7 +4310,6 @@ pa_hook_result_t route_sink_unlink_cb(pa_core *c, pa_sink *sink, struct userdata
     else
     {
         const char *deviceNameDetail;
-        const char *deviceIcon;
         if (sink->module && pa_streq(sink->module->name, MODULE_ALSA_SINK_NAME))
         {
             u->callback_deviceName = sink->name;
@@ -4564,43 +4478,12 @@ pa_hook_result_t sink_load_subscription_callback(pa_core *c, pa_sink_new_data *d
     return PA_HOOK_OK;
 }
 
-static const char *const device_valid_modargs[] = {
-    "name",
-    "source_name",
-    "source_properties",
-    "namereg_fail",
-    "device",
-    "device_id",
-    "format",
-    "rate",
-    "alternate_rate",
-    "channels",
-    "channel_map",
-    "fragments",
-    "fragment_size",
-    "mmap",
-    "tsched",
-    "tsched_buffer_size",
-    "tsched_buffer_watermark",
-    "ignore_dB",
-    "control",
-    "deferred_volume",
-    "deferred_volume_safety_margin",
-    "deferred_volume_extra_delay",
-    "fixed_latency_range",
-    "sink_name",
-    "sink_properties",
-    "rewind_safeguard",
-    NULL};
-
 pa_hook_result_t module_unload_subscription_callback(pa_core *c, pa_module *m, struct userdata *u)
 {
     pa_log_info("module_unload_subscription_callback");
     pa_assert(c);
     pa_assert(m);
     pa_assert(u);
-    pa_modargs *ma = NULL;
-    pa_sink_new_data data;
     pa_log_debug("module_unloaded with index#:%u", m->index);
     if (!strcmp(m->name, MODULE_ALSA_SINK_NAME))
         check_and_remove_usb_device_module(u, true, m);
@@ -4617,7 +4500,6 @@ pa_hook_result_t module_load_subscription_callback(pa_core *c, pa_module *m, str
     pa_assert(m);
     pa_assert(u);
     pa_log_debug("module_loaded with name:%s", m->name);
-    pa_modargs *ma = NULL;
 
     return PA_HOOK_OK;
 }

@@ -78,7 +78,7 @@ static struct _virtualsinkmap virtualsinkmap[] = {
     {"default2",        (uint32_t)edefault2, "default2", 0, 0, false},
     {"tts2",            (uint32_t)etts2, "tts2", 0, 0, false},
     {"voipcall2",       (uint32_t)evoipcall2, "voipcall2", 0, 0, false},
-    {NULL, 0}
+    {NULL, 0, "", 0, 0, 0}
 };
 
 static struct _virtualsourcemap virtualsourcemap[] = {
@@ -91,14 +91,14 @@ static struct _virtualsourcemap virtualsourcemap[] = {
     {"record1",          (uint32_t)erecord1, "record1", 0, 0, false},
     {"alexa1",           (uint32_t)ealexa1, "alexa1", 0, 0, false},
     {"webcall2",         (uint32_t)ewebcall2, "webcall2", 0, 0, false},
-    {NULL, 0}
+    {NULL, 0, "", 0, 0, 0}
 };
 
 /*
     Volume level curves, [0] for headset, [1] for other paths, like back speaker, front speaker.
  */
 
-static int _mapPercentToPulseVolume[2][101] = {
+static __attribute__((unused)) int _mapPercentToPulseVolume[2][101] = {
 
     {0,     34000,  39586,  39851,  40115,  40380,  40645,  40910,  41175,  41439,
     41704,  41969,  42234,  42498,  42763,  43028,  43293,  43558,  43822,  44087,
@@ -153,7 +153,7 @@ static float _mapPercentToPulseRamp[2][101] = {
 #define MAX_FILTER_TABLES 5
 
 /* B0, B1, B2, A1, A2 */
-static int32_t _filterTable[MAX_FILTER_TABLES][20] = {
+static __attribute__((unused)) int32_t _filterTable[MAX_FILTER_TABLES][20] = {
 
     {0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  /* placeholding, dummy table */
      0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
