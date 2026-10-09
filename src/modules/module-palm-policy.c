@@ -1918,10 +1918,10 @@ static bool load_Bluetooth_module(struct userdata *u)
             index++;
         }
         snprintf(physicalSinkBT, sizeof(physicalSinkBT), "%s%s", btSinkInit, u->address);
-        for (size_t index = 0; index < strlen(physicalSinkBT); index++)
+        for (size_t j = 0; j < strlen(physicalSinkBT); j++)
         {
-            if (physicalSinkBT[index] == ':')
-                physicalSinkBT[index] = '_';
+            if (physicalSinkBT[j] == ':')
+                physicalSinkBT[j] = '_';
         }
         copy_field(u->physicalSinkBT, sizeof(u->physicalSinkBT), physicalSinkBT);
         if (NULL == u->btDiscoverModule)
@@ -1954,7 +1954,6 @@ static bool load_lineout_alsa_sink(struct userdata *u, int soundcardNo, int devi
 {
     pa_assert(u);
     int sink = 0;
-    char *args = NULL;
     /* Request for lineout loading
      * Load Alsa Sink Module
      * Send Error To AudioD in case Alsa sink Load fails
@@ -3334,41 +3333,31 @@ static pa_hook_result_t route_sink_input_new_hook_callback(pa_core *c, pa_sink_i
     {
         /* redirect everything to the default application stream */
         pa_log_info("THE DEFAULT DEVICE WAS USED TO CREATE THIS STREAM - PLEASE CATEGORIZE USING A VIRTUAL STREAM");
-        char *si_type = pa_proplist_gets(data->proplist, "media.role");
-        if ((si_type) && (0 == strncmp(si_type, "music", 5)))
+        const char *role = pa_proplist_gets(data->proplist, "media.role");
+        const char *virtualsink;
+        /* The music role was meant for btstream (A2DP), but the code that set
+         * it fell through into the default branch, so such streams have always
+         * gone to pdefaultapp. Keep that until the routing can be verified on
+         * a device; only the phone role has ever reached its own sink. */
+        if (role && 0 == strncmp(role, "phone", 5))
         {
-            pa_proplist_sets(type, "media.type", "btstream");
-            pa_proplist_update(data->proplist, PA_UPDATE_MERGE, type);
-            char *si_type = pa_proplist_gets(data->proplist, "media.type");
-            sink = pa_namereg_get(c, "btstream", PA_NAMEREG_SINK);
-            pa_assert(sink != NULL);
-            data->sink = sink;
-            sink = NULL;
-            sink_index = ebtstream;
-            pa_log_info("A2DP source media type %s sink-name %s", si_type, data->sink->name);
-        }
-        if ((si_type) && (0 == strncmp(si_type, "phone", 5)))
-        {
-            pa_proplist_sets(type, "media.type", "btcall");
-            pa_proplist_update(data->proplist, PA_UPDATE_MERGE, type);
-            char *si_type = pa_proplist_gets(data->proplist, "media.type");
-            sink = pa_namereg_get(c, "btcall", PA_NAMEREG_SINK);
-            pa_assert(sink != NULL);
-            data->sink = sink;
-            sink = NULL;
+            virtualsink = "btcall";
             sink_index = ebtcall;
-            pa_log_info("HFP call  media type %s sink-name %s", si_type, data->sink->name);
         }
         else
         {
+            virtualsink = "pdefaultapp";
             sink_index = edefaultapp;
-            pa_proplist_sets(type, "media.type", "pdefaultapp");
-            pa_proplist_update(data->proplist, PA_UPDATE_MERGE, type);
-            sink = pa_namereg_get(c, "pdefaultapp", PA_NAMEREG_SINK);
-            pa_assert(sink != NULL);
-            data->sink = sink;
-            sink = NULL;
         }
+        pa_proplist_sets(type, "media.type", virtualsink);
+        pa_proplist_update(data->proplist, PA_UPDATE_MERGE, type);
+        sink = pa_namereg_get(c, virtualsink, PA_NAMEREG_SINK);
+        if (sink)
+            data->sink = sink;
+        else
+            pa_log_warn("virtual sink %s does not exist", virtualsink);
+        pa_log_info("stream of role %s goes to %s", role ? role : "(none)", virtualsink);
+        sink = NULL;
 
         sink = pa_namereg_get(c, u->sink_mapping_table[sink_index].outputdevice, PA_NAMEREG_SINK);
 
