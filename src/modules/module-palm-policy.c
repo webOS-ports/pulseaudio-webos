@@ -982,7 +982,10 @@ static bool set_source_inputdevice(struct userdata *u, char *inputdevice, int so
         }
     }
     else
+    {
         pa_log_warn("set_source_inputdevice: sourceId is not valid");
+        return false;
+    }
     return true;
 }
 
@@ -1017,7 +1020,10 @@ static bool set_sink_outputdevice(struct userdata *u, char *outputdevice, int si
         }
     }
     else
+    {
         pa_log_warn("set_sink_outputdevice: sinkid is not valid");
+        return false;
+    }
     return true;
 }
 
@@ -1052,7 +1058,10 @@ static bool set_sink_outputdevice_on_range(struct userdata *u, char *outputdevic
         }
     }
     else
+    {
         pa_log_warn("set_sink_outputdevice_on_range: start and end sink are not in range");
+        return false;
+    }
     return true;
 }
 
@@ -1087,7 +1096,10 @@ static bool set_source_inputdevice_on_range(struct userdata *u, char *inputdevic
         }
     }
     else
+    {
         pa_log_warn("set_source_inputdevice_on_range: start and end source are not in range");
+        return false;
+    }
     return true;
 }
 
@@ -1121,7 +1133,10 @@ static bool set_default_sink_routing(struct userdata *u, int startsinkid, int en
         }
     }
     else
+    {
         pa_log_warn("set_default_sink_routing: start and end sink are not in range");
+        return false;
+    }
     return true;
 }
 
@@ -1155,7 +1170,10 @@ static bool set_default_source_routing(struct userdata *u, int startsourceid, in
         }
     }
     else
+    {
         pa_log_warn("set_default_source_routing: start and end source are not in range");
+        return false;
+    }
     return true;
 }
 
@@ -1188,7 +1206,10 @@ static bool virtual_source_output_move_inputdevice(int virtualsourceid, char *in
         }
     }
     else
+    {
         pa_log("virtual_source_input_set_physical_source: source ID out of range");
+        return false;
+    }
     return true;
 }
 
@@ -1244,7 +1265,10 @@ static bool virtual_sink_input_move_outputdevice(int virtualsinkid, char *output
         }
     }
     else
+    {
         pa_log("virtual_sink_input_move_outputdevice: sink ID out of range");
+        return false;
+    }
     return true;
 }
 
@@ -3150,20 +3174,20 @@ static void disconnect_hooks(struct userdata *u)
 }
 
 /* entry point for the module*/
-int pa__init(pa_module *m)
+/* The module's state, set up as pa__init() needs it but without hooks, socket
+ * or shared objects - so that tests can build one around a core of their own. */
+static struct userdata *userdata_new(pa_core *core, pa_module *m)
 {
     struct userdata *u = NULL;
     int i;
 
-    pa_assert(m);
     u = pa_xnew0(struct userdata, 1);
 
-    u->core = m->core;
+    u->core = core;
     u->module = m;
     /* no socket and no connection yet, whatever pa__done() is reached from */
     u->sockfd = -1;
     u->newsockfd = -1;
-    m->userdata = u;
 
     u->alsa_sink1 = NULL;
     u->alsa_sink2 = NULL;
@@ -3171,8 +3195,6 @@ int pa__init(pa_module *m)
 
     PA_LLIST_HEAD_INIT(struct sinkinputnode, u->sinkinputnodelist);
     PA_LLIST_HEAD_INIT(struct sourceoutputnode, u->sourceoutputnodelist);
-
-    connect_to_hooks(u);
 
     /* copy the default sink mapping */
     for (i = 0; i < eVirtualSink_Count; i++)
@@ -3258,6 +3280,19 @@ int pa__init(pa_module *m)
     u->internalOutputDeviceInfo->baseName = NULL;
     u->internalOutputDeviceInfo->maxDeviceCount = 0;
     u->internalOutputDeviceInfo->deviceList = NULL;
+
+    return u;
+}
+
+int pa__init(pa_module *m)
+{
+    struct userdata *u;
+
+    pa_assert(m);
+    u = userdata_new(m->core, m);
+    m->userdata = u;
+
+    connect_to_hooks(u);
 
     if (!(u->palm_policy = pa_palm_policy_get(u->core)))
     {
@@ -4177,10 +4212,45 @@ static pa_hook_result_t route_source_output_unlink_hook_callback(pa_core *c, pa_
 
 /* exit and cleanup */
 
+/* Free the module's state as userdata_new() made it, with everything it owns.
+ * Hooks, socket and shared objects are pa__done()'s to release first. */
+static void userdata_free(struct userdata *u)
+{
+    struct sinkinputnode *thelistitem = NULL;
+
+    /* free the list of sink-inputs */
+    while ((thelistitem = u->sinkinputnodelist) != NULL)
+    {
+        PA_LLIST_REMOVE(struct sinkinputnode, u->sinkinputnodelist, thelistitem);
+        pa_xfree(thelistitem);
+    }
+
+    /* and of source-outputs */
+    struct sourceoutputnode *node;
+    while ((node = u->sourceoutputnodelist) != NULL)
+    {
+        PA_LLIST_REMOVE(struct sourceoutputnode, u->sourceoutputnodelist, node);
+        pa_xfree(node);
+    }
+
+    // free memory
+    multiple_device_info_free(&u->usbOutputDeviceInfo);
+
+    multiple_device_info_free(&u->usbInputDeviceInfo);
+
+    multiple_device_info_free(&u->internalInputDeviceInfo);
+
+    multiple_device_info_free(&u->internalOutputDeviceInfo);
+
+    pa_xfree(u->destAddress);
+    pa_xfree(u->connectionType);
+    pa_xfree(u->deviceName);
+    pa_xfree(u);
+}
+
 void pa__done(pa_module *m)
 {
     struct userdata *u;
-    struct sinkinputnode *thelistitem = NULL;
 
     pa_assert(m);
 
@@ -4210,37 +4280,11 @@ void pa__done(pa_module *m)
 
     disconnect_hooks(u);
 
-    /* free the list of sink-inputs */
-    while ((thelistitem = u->sinkinputnodelist) != NULL)
-    {
-        PA_LLIST_REMOVE(struct sinkinputnode, u->sinkinputnodelist, thelistitem);
-        pa_xfree(thelistitem);
-    }
-
-    /* and of source-outputs */
-    struct sourceoutputnode *node;
-    while ((node = u->sourceoutputnodelist) != NULL)
-    {
-        PA_LLIST_REMOVE(struct sourceoutputnode, u->sourceoutputnodelist, node);
-        pa_xfree(node);
-    }
-
-    // free memory
-    multiple_device_info_free(&u->usbOutputDeviceInfo);
-
-    multiple_device_info_free(&u->usbInputDeviceInfo);
-
-    multiple_device_info_free(&u->internalInputDeviceInfo);
-
-    multiple_device_info_free(&u->internalOutputDeviceInfo);
-
     if (u->palm_policy)
         pa_palm_policy_unref(u->palm_policy);
 
-    pa_xfree(u->destAddress);
-    pa_xfree(u->connectionType);
-    pa_xfree(u->deviceName);
-    pa_xfree(u);
+    userdata_free(u);
+    m->userdata = NULL;
 }
 
 static pa_hook_result_t route_sink_input_move_finish_cb(pa_core *c, pa_sink_input *data, struct userdata *u)
