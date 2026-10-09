@@ -357,7 +357,7 @@ static bool virtual_source_output_move_inputdevice(int virtualsourceid, char *in
 
 static bool virtual_source_set_mute(int sourceid, int mute, struct userdata *u);
 
-static bool virtual_source_input_set_volume(int sinkid, int volumetoset, int volumetable, struct userdata *u);
+static bool virtual_source_input_set_volume(int sourceId, int volumetoset, int volumetable, struct userdata *u);
 
 
 static void virtual_source_input_index_set_volume(int sourceId, int index, int volumetoset, int volumetable, struct userdata *u);
@@ -394,7 +394,7 @@ static pa_hook_result_t route_sink_input_new_hook_callback(pa_core *c, pa_sink_i
 static pa_hook_result_t route_sink_input_fixate_hook_callback(pa_core *c, pa_sink_input_new_data *data,
                                                               struct userdata *u);
 
-static pa_hook_result_t route_sink_input_put_hook_callback(pa_core *c, pa_sink_input *si,
+static pa_hook_result_t route_sink_input_put_hook_callback(pa_core *c, pa_sink_input *data,
                                                            struct userdata *u);
 
 static pa_hook_result_t route_source_output_new_hook_callback(pa_core *c, pa_source_output_new_data *data,
@@ -431,7 +431,7 @@ static pa_hook_result_t route_sink_unlink_post_cb(pa_core *c, pa_sink *sink, str
 
 static pa_hook_result_t route_source_unlink_post_cb(pa_core *c, pa_source *source, struct userdata *u);
 
-static pa_hook_result_t route_source_output_state_changed_hook_callback(pa_core *c, pa_source_output *data,
+static pa_hook_result_t route_source_output_state_changed_hook_callback(pa_core *c, pa_source_output *so,
                                                                         struct userdata *u);
 
 static pa_hook_result_t route_source_output_unlink_hook_callback(pa_core *c, pa_source_output *data,
@@ -447,7 +447,7 @@ static bool set_sink_outputdevice(struct userdata *u, char *outputdevice, int si
 
 static bool set_sink_outputdevice_on_range(struct userdata *u, char *outputdevice, int startsinkid, int endsinkid);
 
-static bool set_source_inputdevice_on_range(struct userdata *u, char *outputdevice, int startsourcekid, int endsourceid);
+static bool set_source_inputdevice_on_range(struct userdata *u, char *inputdevice, int startsourceid, int endsourceid);
 
 static bool set_default_sink_routing(struct userdata *u, int startsinkid, int endsinkid);
 
@@ -862,8 +862,13 @@ static void find_and_load_usb_devices(struct userdata *u, const char *deviceName
         dev = -1;
         while (1)
         {
+            /* on failure dev is left as it was: stop rather than ask for the
+             * same device again forever */
             if (snd_ctl_pcm_next_device(handle, &dev) < 0)
-                pa_log_warn("snd_ctl_pcm_next_device");
+            {
+                pa_log_warn("snd_ctl_pcm_next_device failed on card %d", card);
+                break;
+            }
             if (dev < 0)
                 break;
             snd_pcm_info_set_device(pcminfo, dev);
@@ -1811,9 +1816,14 @@ static void send_rtp_connection_data_to_audiod(const char *ip, const char *port,
 {
     pa_assert(ip);
     pa_assert(port);
-    int port_value = atoi(port);
+    int32_t port_value = 0;
+    if (pa_atoi(port, &port_value) < 0 || port_value < 0 || port_value > 0xFFFF)
+    {
+        pa_log_warn("[send_rtp_connection_data_to_audiod] invalid port %s", port);
+        port_value = 0;
+    }
 
-    pa_log("[send_rtp_connection_data_to_audiod] ip = %s port = %d", ip, port_value);
+    pa_log("[send_rtp_connection_data_to_audiod] ip = %s port = %d", ip, (int)port_value);
     /* The connection that module-rtp-send set up: its address and port, as the
      * old text form of this message ("t 0 0 <ip> <port>") carried them. */
     struct paReplyToModuleSet moduleSet;
@@ -1821,7 +1831,7 @@ static void send_rtp_connection_data_to_audiod(const char *ip, const char *port,
     moduleSet.Type = PAUDIOD_REPLY_MODULE_CAST_RTP;
     moduleSet.sink = 0;
     moduleSet.info = 0;
-    moduleSet.port = port_value;
+    moduleSet.port = (uint32_t)port_value;
     snprintf(moduleSet.ip, sizeof(moduleSet.ip), "%s", ip);
 
     if (!send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_MODULE, 0, &moduleSet, sizeof(moduleSet)))
@@ -2750,10 +2760,6 @@ static void handle_io_event_socket(pa_mainloop_api *ea, pa_io_event *e, int fd, 
     pa_assert(u);
     pa_assert(fd == u->sockfd);
 
-    if (events & PA_IO_EVENT_NULL)
-    {
-        pa_log_info("handle_io_event_socket PA_IO_EVENT_NULL received");
-    }
     if (events & PA_IO_EVENT_INPUT)
     {
         /* do we have a connection on our socket yet? */
@@ -3334,17 +3340,18 @@ static pa_hook_result_t route_sink_input_new_hook_callback(pa_core *c, pa_sink_i
             }
         }
 
-        sink = pa_namereg_get(c, u->sink_mapping_table[i].outputdevice, PA_NAMEREG_SINK);
-
-        pa_log_info("routing to device:%s", u->sink_mapping_table[i].outputdevice);
-        if (pa_streq(data->sink->name, u->sink_mapping_table[i].virtualsinkname))
+        if (i < eVirtualSink_Count)
         {
-            pa_assert(sink != NULL);
-            data->sink = sink;
-            sink = NULL;
-            if (sink && PA_SINK_IS_LINKED(sink->state))
-                pa_sink_input_new_data_set_sink(data, sink, FALSE, FALSE);
+            /* opened on a virtual sink: route it to where that sink goes */
+            sink = pa_namereg_get(c, u->sink_mapping_table[i].outputdevice, PA_NAMEREG_SINK);
+            pa_log_info("routing to device:%s", u->sink_mapping_table[i].outputdevice);
+            if (sink)
+                data->sink = sink;
+            else
+                pa_log_warn("no sink %s to route %s to", u->sink_mapping_table[i].outputdevice, data->sink->name);
         }
+        else
+            pa_log_debug("%s is not a virtual sink, leaving the stream on it", data->sink->name);
     }
     if (type)
         pa_proplist_free(type);
@@ -4309,13 +4316,9 @@ pa_hook_result_t route_sink_unlink_cb(pa_core *c, pa_sink *sink, struct userdata
     }
     else
     {
-        const char *deviceNameDetail;
         if (sink->module && pa_streq(sink->module->name, MODULE_ALSA_SINK_NAME))
         {
             u->callback_deviceName = sink->name;
-            deviceNameDetail = pa_proplist_gets(sink->proplist, ALSA_CARD_NAME);
-            if (!deviceNameDetail)
-                deviceNameDetail = sink->name;
             /* notify audiod of device removal */
             if (u->connectionactive && u->connev)
             {
