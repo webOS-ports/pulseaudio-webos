@@ -1,0 +1,6 @@
+# Appended by run.sh to the rootfs's own webos-virtual-devices.pa: null sinks in
+# place of the hardware ones, a private native socket for pacat, and the module.
+load-module module-null-sink sink_name=pcm_output
+load-module module-null-source source_name=pcm_input
+load-module module-native-protocol-unix auth-anonymous=1 socket=@NATIVE@
+load-module module-palm-policy
