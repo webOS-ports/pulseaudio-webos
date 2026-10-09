@@ -2058,6 +2058,7 @@ static bool set_audio_effect(struct userdata *u, const char* effect, int enabled
 
         pa_log_info("load-module module-preprocess %s", args);
         pa_module_load(&u->preprocess_module, u->core, "module-preprocess-source", args);
+        pa_xfree(args);
 
         struct sinkinputnode *thelistitem = NULL;
         pa_sink *destsink = NULL;
@@ -2544,7 +2545,8 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
         case PAUDIOD_DEVICE_LOAD_LINEOUT_ALSA_SINK:
         {
             // 'i'
-            u->deviceName = SndHdr->device;
+            /* keep a copy: the record is reused for the next message */
+            copy_field(u->deviceName, DEVICE_NAME_LENGTH, SndHdr->device);
             pa_log_info("received lineout loading cmd from Audiod  cardno:%d,deviceno:%d,status:%d,isoutput:%d,name: %s",
                         SndHdr->cardNo, SndHdr->deviceNo, SndHdr->status, SndHdr->isOutput, u->deviceName);
             if (1 == SndHdr->status)
@@ -4237,6 +4239,7 @@ void pa__done(pa_module *m)
 
     pa_xfree(u->destAddress);
     pa_xfree(u->connectionType);
+    pa_xfree(u->deviceName);
     pa_xfree(u);
 }
 
