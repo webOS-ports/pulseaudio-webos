@@ -33,6 +33,7 @@
 #include <stdint.h>
 #include <errno.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 #include <pulse/xmalloc.h>
 #include <pulse/mainloop.h>
@@ -65,7 +66,6 @@
 #endif
 
 #define _MEM_ZERO(object) (memset(&(object), '\0', sizeof((object))))
-#define _NAME_STRUCT_OFFSET(struct_type, member) ((long)((unsigned char *)&((struct_type *)0)->member))
 
 #ifndef PALM_UP_RAMP_MSEC
 #define PALM_UP_RAMP_MSEC 600
@@ -2970,7 +2970,7 @@ static int make_socket(struct userdata *u)
 
     /* bind it to a name */
     if (-1 ==
-        bind(u->sockfd, (struct sockaddr *)&(u->name), _NAME_STRUCT_OFFSET(struct sockaddr_un, sun_path) + path_len))
+        bind(u->sockfd, (struct sockaddr *)&(u->name), (socklen_t)(offsetof(struct sockaddr_un, sun_path) + (size_t)path_len)))
     {
         pa_log("Error in bind (%d) ", errno);
         goto fail;
