@@ -221,6 +221,8 @@ struct userdata
     pa_io_event *sockev;        /* socket event handler */
     pa_io_event *connev;        /* connection event handler */
     bool connectionactive; /* do we have an active connection on the socket */
+    char rxbuf[SIZE_MESG_TO_PULSE]; /* the message from audiod being received */
+    size_t rxlen;                   /* how much of it has arrived */
 
     // Maintain count of sinks opened, as sent to audiod, so that we can re-send data on reconnect for audiod to resync with us
     int32_t audiod_sink_input_opened[eVirtualSink_Count];
@@ -2215,9 +2217,24 @@ void send_callback_to_audiod(int id, int returnVal, struct userdata *u)
 /* Parse a message sent from audiod and invoke
  * requested changes in pulseaudio
  */
+/* Every message from audiod is one record of SIZE_MESG_TO_PULSE bytes, which
+ * each of the request types has to fit in. */
+_Static_assert(sizeof(struct paudiodMsgHdr) + sizeof(struct paRoutingSet) <= SIZE_MESG_TO_PULSE, "routing request too large");
+_Static_assert(sizeof(struct paudiodMsgHdr) + sizeof(struct paVolumeSet) <= SIZE_MESG_TO_PULSE, "volume request too large");
+_Static_assert(sizeof(struct paudiodMsgHdr) + sizeof(struct paDeviceSet) <= SIZE_MESG_TO_PULSE, "device request too large");
+_Static_assert(sizeof(struct paudiodMsgHdr) + sizeof(struct paModuleSet) <= SIZE_MESG_TO_PULSE, "module request too large");
+_Static_assert(sizeof(struct paudiodMsgHdr) + sizeof(struct paParamSet) <= SIZE_MESG_TO_PULSE, "setparam request too large");
+_Static_assert(sizeof(struct paudiodMsgHdr) + sizeof(struct paEffectSet) <= SIZE_MESG_TO_PULSE, "effect request too large");
+
 static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
 {
     int HdrLen = sizeof(struct paudiodMsgHdr);
+
+    if (bufsize != SIZE_MESG_TO_PULSE)
+    {
+        pa_log("parse_message: message of %d bytes, expected %d", bufsize, SIZE_MESG_TO_PULSE);
+        return;
+    }
     pa_log_info("parse_message: paudio msg hdr length=%d", HdrLen);
     struct paudiodMsgHdr *msgHdr = (struct paudiodMsgHdr *)msgbuf;
     pa_log_info("parse_message: message type=%x, message ID=%x", msgHdr->msgType, msgHdr->msgID);
@@ -2233,6 +2250,8 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
     case PAUDIOD_MSGTYPE_ROUTING:
     {
         struct paRoutingSet *SndHdr = (struct paRoutingSet *)(msgbuf + HdrLen);
+        /* the strings come off the wire: never read past their fields */
+        SndHdr->device[sizeof(SndHdr->device) - 1] = '\0';
         char device[DEVICE_NAME_LENGTH];
         int startID;
         int endID;
@@ -2327,6 +2346,8 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
     case PAUDIOD_MSGTYPE_VOLUME:
     {
         struct paVolumeSet *SndHdr = (struct paVolumeSet *)(msgbuf + HdrLen);
+        /* the strings come off the wire: never read past their fields */
+        SndHdr->device[sizeof(SndHdr->device) - 1] = '\0';
         pa_log_info("parse_message: HDR Volume=%x", SndHdr->volume);
         pa_log_info("parse_message: Volume string name HDR=%d", SndHdr->Type);
         switch (SndHdr->Type)
@@ -2458,6 +2479,8 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
     case PAUDIOD_MSGTYPE_DEVICE:
     {
         struct paDeviceSet *SndHdr = (struct paDeviceSet *)(msgbuf + HdrLen);
+        /* the strings come off the wire: never read past their fields */
+        SndHdr->device[sizeof(SndHdr->device) - 1] = '\0';
         int status = 0;
         int cardNo;
         int deviceNo;
@@ -2525,6 +2548,11 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
     case PAUDIOD_MSGTYPE_MODULE:
     {
         struct paModuleSet *SndHdr = (struct paModuleSet *)(msgbuf + HdrLen);
+        /* the strings come off the wire: never read past their fields */
+        SndHdr->ip[sizeof(SndHdr->ip) - 1] = '\0';
+        SndHdr->device[sizeof(SndHdr->device) - 1] = '\0';
+        SndHdr->address[sizeof(SndHdr->address) - 1] = '\0';
+        SndHdr->profile[sizeof(SndHdr->profile) - 1] = '\0';
         switch (SndHdr->Type)
         {
         case PAUDIOD_MODULE_RTP_LOAD:
@@ -2749,6 +2777,7 @@ static void handle_io_event_socket(pa_mainloop_api *ea, pa_io_event *e, int fd, 
                                                   PA_IO_EVENT_HANGUP | PA_IO_EVENT_ERROR,
                                               handle_io_event_connection, u);
                 u->connectionactive = true; /* flag that we have an active connection */
+                u->rxlen = 0;
 
                 // TODO to check if we need to send sink input index and corresponding app name with one more loop for both sink and source
                 /* Tell audiod how many sink of each category is opened */
@@ -2800,61 +2829,69 @@ static void handle_io_event_socket(pa_mainloop_api *ea, pa_io_event *e, int fd, 
  * client (audiod).  This routine will createlisten on
  * the socket and parse and act upon messages sent to
  * the socket connection */
+/* Tear down the connection to audiod, so that a new one can be accepted. */
+static void close_connection(struct userdata *u)
+{
+    pa_assert(u);
+
+    if (u->connev)
+    {
+        /* remove ourselves from the IO list on the main loop */
+        u->core->mainloop->io_free(u->connev);
+        u->connev = NULL;
+    }
+    if (u->newsockfd != -1)
+    {
+        if (-1 == shutdown(u->newsockfd, SHUT_RDWR))
+            pa_log_info("Error in shutdown (%d):%s", errno, strerror(errno));
+        if (-1 == close(u->newsockfd))
+            pa_log_info("Error in close (%d):%s", errno, strerror(errno));
+        u->newsockfd = -1;
+    }
+    u->connectionactive = false;
+    u->rxlen = 0;
+}
+
 static void handle_io_event_connection(pa_mainloop_api *ea, pa_io_event *e, int fd, pa_io_event_flags_t events, void *userdata)
 {
     struct userdata *u = userdata;
-    char buf[SIZE_MESG_TO_PULSE];
-    int bytesread;
+    ssize_t bytesread;
 
     pa_assert(u);
     pa_assert(fd == u->newsockfd);
 
-    if (events & PA_IO_EVENT_NULL)
-    {
-        pa_log_info("handle_io_event_connection PA_IO_EVENT_NULL received");
-    }
     if (events & PA_IO_EVENT_INPUT)
     {
-        if (-1 == (bytesread = recv(u->newsockfd, buf, SIZE_MESG_TO_PULSE, 0)))
+        /* audiod sends fixed records of SIZE_MESG_TO_PULSE bytes over a stream
+         * socket, which may deliver one in pieces: collect a whole record
+         * before acting on it. */
+        bytesread = recv(u->newsockfd, u->rxbuf + u->rxlen, sizeof(u->rxbuf) - u->rxlen, 0);
+        if (bytesread < 0)
         {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+                return;
             pa_log_info("handle_io_event_connection Error in recv (%d): %s ", errno, strerror(errno));
+            close_connection(u);
+            return;
         }
-        else
+        if (bytesread == 0)
         {
-            if (bytesread != 0)
-            { /* the socket connection will return zero bytes on EOF */
-                parse_message(buf, SIZE_MESG_TO_PULSE, u);
-            }
+            pa_log_info("handle_io_event_connection audiod closed the connection");
+            close_connection(u);
+            return;
+        }
+        u->rxlen += (size_t)bytesread;
+        if (u->rxlen == sizeof(u->rxbuf))
+        {
+            u->rxlen = 0;
+            parse_message(u->rxbuf, sizeof(u->rxbuf), u);
         }
     }
-    if (events & PA_IO_EVENT_OUTPUT)
+    if (events & (PA_IO_EVENT_HANGUP | PA_IO_EVENT_ERROR))
     {
-        pa_log_info("handle_io_event_connection PA_IO_EVENT_OUTPUT received");
+        pa_log_info("handle_io_event_connection Socket is being closed (events 0x%x)", (unsigned)events);
+        close_connection(u);
     }
-    if (events & PA_IO_EVENT_HANGUP)
-    {
-        pa_log_info("handle_io_event_connection PA_IO_EVENT_HANGUP received");
-        pa_log_info("handle_io_event_connection Socket is being closed");
-        /* remove ourselves from the IO list on the main loop */
-        u->core->mainloop->io_free(u->connev);
-
-        /* tear down the connection */
-        if (-1 == shutdown(u->newsockfd, SHUT_RDWR))
-        {
-            pa_log_info("Error in shutdown (%d):%s", errno, strerror(errno));
-        }
-        if (-1 == close(u->newsockfd))
-        {
-            pa_log_info("Error in close (%d):%s", errno, strerror(errno));
-        }
-
-        /* reset vars in userdata, allows another connection to be rebuilt */
-        u->connectionactive = false;
-        u->connev = NULL;
-        u->newsockfd = -1;
-    }
-    if (events & PA_IO_EVENT_ERROR)
-        pa_log_info("handle_io_event_connection PA_IO_EVENT_ERROR received");
 }
 
 static int make_socket(struct userdata *u)
@@ -2875,7 +2912,8 @@ static int make_socket(struct userdata *u)
 
     if (path_len > _MAX_NAME_LEN)
     {
-        pa_log("%s: Path name is too long '%s'\n", __FUNCTION__, strerror(errno));
+        pa_log("%s: socket name is too long", __FUNCTION__);
+        goto fail;
     }
 
     strncpy(&u->name.sun_path[1], PALMAUDIO_SOCK_NAME, path_len);
@@ -2914,6 +2952,11 @@ static int make_socket(struct userdata *u)
                                   handle_io_event_socket, u);
     return 0;
 fail:
+    if (u->sockfd != -1)
+    {
+        close(u->sockfd);
+        u->sockfd = -1;
+    }
     return -1;
 }
 
@@ -3050,6 +3093,9 @@ int pa__init(pa_module *m)
 
     u->core = m->core;
     u->module = m;
+    /* no socket and no connection yet, whatever pa__done() is reached from */
+    u->sockfd = -1;
+    u->newsockfd = -1;
     m->userdata = u;
 
     u->alsa_sink1 = NULL;
@@ -4076,22 +4122,8 @@ void pa__done(pa_module *m)
     if (!(u = m->userdata))
         return;
 
-    if (u->connev != NULL)
-    {
-        /* a connection exists on the socket, tear down */
-        /* remove ourselves from the IO list on the main loop */
-        u->core->mainloop->io_free(u->connev);
-
-        /* tear down the connection */
-        if (-1 == shutdown(u->newsockfd, SHUT_RDWR))
-        {
-            pa_log_info("Error in shutdown (%d):%s", errno, strerror(errno));
-        }
-        if (-1 == close(u->newsockfd))
-        {
-            pa_log_info("Error in close (%d):%s", errno, strerror(errno));
-        }
-    }
+    /* a connection exists on the socket, tear down */
+    close_connection(u);
 
     if (u->sockev != NULL)
     {
