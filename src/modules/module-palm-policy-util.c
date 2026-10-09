@@ -43,22 +43,22 @@ pa_hook* pa_palm_policy_hook(pa_palm_policy *pp, pa_palm_policy_hook_t hook) {
     return &pp->hooks[hook];
 }
 
-pa_palm_policy* pa_palm_policy_get(pa_core *c) {
+pa_palm_policy* pa_palm_policy_get(pa_core *core) {
     pa_palm_policy *pp;
     unsigned i;
 
     /* one per core, shared with whoever else asks for it */
-    if ((pp = pa_shared_get(c, "palm-policy")))
+    if ((pp = pa_shared_get(core, "palm-policy")))
         return pa_palm_policy_ref(pp);
 
     pp = pa_xnew0(pa_palm_policy, 1);
     PA_REFCNT_INIT(pp);
-    pp->core = c;
+    pp->core = core;
 
     for (i = 0; i < PA_PALM_POLICY_HOOK_MAX; i++)
         pa_hook_init(&pp->hooks[i], pp);
 
-    pa_shared_set(c, "palm-policy", pp);
+    pa_shared_set(core, "palm-policy", pp);
     return pp;
 }
 
