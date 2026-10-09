@@ -331,6 +331,19 @@ static bool send_to_audiod(struct userdata *u, uint32_t msgType, uint32_t msgID,
     return true;
 }
 
+/* _mapPercentToPulseRamp is indexed by a volume table and a volume in
+ * percent, both of which come from audiod. */
+static bool volume_in_range(int volumetable, int volume)
+{
+    if (volumetable < 0 || volumetable >= (int)PA_ELEMENTSOF(_mapPercentToPulseRamp) ||
+        volume < MIN_VOLUME || volume > MAX_VOLUME)
+    {
+        pa_log_warn("volume %d in table %d is out of range", volume, volumetable);
+        return false;
+    }
+    return true;
+}
+
 static bool virtual_source_output_move_inputdevice(int virtualsourceid, char *inputdevice, struct userdata *u);
 
 static bool virtual_source_set_mute(int sourceid, int mute, struct userdata *u);
@@ -445,6 +458,53 @@ PA_MODULE_VERSION(PULSEAUDIO_VERSION);
 PA_MODULE_LOAD_ONCE(true);
 PA_MODULE_USAGE("No parameters for this module");
 
+/* audiod says how many devices of a kind to keep slots for. Far above anything
+ * real, low enough that a bad record cannot make pa_xnew() abort the daemon. */
+#define MAX_DEVICE_COUNT 64
+
+/* Empty a device slot. Its ALSA module, if any, is the caller's to unload. */
+static void device_slot_reset(deviceInfo *d)
+{
+    d->cardNumber = -1;
+    d->deviceNumber = -1;
+    d->alsaModule = NULL;
+    free(d->cardNameDetail); /* from snd_card_get_name(), which mallocs it */
+    d->cardNameDetail = NULL;
+}
+
+/* Free a device list and everything it owns, at module unload. The ALSA
+ * modules are the core's to unload by then, so they are only forgotten. */
+static void multiple_device_info_free(multipleDeviceInfo **pmdi)
+{
+    multipleDeviceInfo *mdi = *pmdi;
+
+    if (!mdi)
+        return;
+    for (int i = 0; mdi->deviceList && i < mdi->maxDeviceCount; i++)
+        device_slot_reset(mdi->deviceList + i);
+    pa_xfree(mdi->deviceList);
+    pa_xfree(mdi->baseName);
+    pa_xfree(mdi);
+    *pmdi = NULL;
+}
+
+/* Unload what the slots of a device list hold and free the list. */
+static void device_list_free(multipleDeviceInfo *mdi)
+{
+    if (!mdi->deviceList)
+        return;
+    for (int i = 0; i < mdi->maxDeviceCount; i++)
+    {
+        deviceInfo *d = mdi->deviceList + i;
+        if (d->alsaModule)
+            pa_module_unload(d->alsaModule, true);
+        device_slot_reset(d);
+    }
+    pa_xfree(mdi->deviceList);
+    mdi->deviceList = NULL;
+    mdi->maxDeviceCount = 0;
+}
+
 bool initialise_internal_card(struct userdata *u, int maxDeviceCount, int isOutput)
 {
     pa_assert(u);
@@ -455,21 +515,22 @@ bool initialise_internal_card(struct userdata *u, int maxDeviceCount, int isOutp
 
     multipleDeviceInfo *mdi = isOutput ? u->internalOutputDeviceInfo : u->internalInputDeviceInfo;
 
-    if (maxDeviceCount <= 0)
+    if (maxDeviceCount <= 0 || maxDeviceCount > MAX_DEVICE_COUNT)
     {
         pa_log_warn("Invalid max device count(%d)", maxDeviceCount);
         return false;
     }
 
+    /* audiod sends this again whenever it restarts: start from a clean list
+     * rather than leaking the old one along with the modules it holds */
+    device_list_free(mdi);
     mdi->maxDeviceCount = maxDeviceCount;
-    mdi->deviceList = pa_xnew(deviceInfo, mdi->maxDeviceCount);
+    mdi->deviceList = pa_xnew0(deviceInfo, mdi->maxDeviceCount);
     for (int i = 0; i < mdi->maxDeviceCount; i++)
     {
         deviceInfo *deviceList = (mdi->deviceList + i);
         deviceList->index = i;
-        deviceList->cardNumber = -1;
-        deviceList->deviceNumber = -1;
-        deviceList->alsaModule = NULL;
+        device_slot_reset(deviceList);
     }
     return true;
 }
@@ -484,9 +545,15 @@ bool init_multiple_usb_device_info(struct userdata *u, bool isOutput, int maxDev
 
     multipleDeviceInfo *mdi = isOutput ? u->usbOutputDeviceInfo : u->usbInputDeviceInfo;
 
-    if (maxDeviceCount <= 0)
+    if (maxDeviceCount <= 0 || maxDeviceCount > MAX_DEVICE_COUNT)
     {
         pa_log_warn("Invalid max device count(%d)", maxDeviceCount);
+        return false;
+    }
+    /* each device is named <baseName><index> in a SINK_NAME_LENGTH field */
+    if (snprintf(NULL, 0, "%s%d", baseName, maxDeviceCount - 1) >= SINK_NAME_LENGTH)
+    {
+        pa_log_warn("Device base name %s is too long", baseName);
         return false;
     }
 
@@ -503,8 +570,7 @@ bool init_multiple_usb_device_info(struct userdata *u, bool isOutput, int maxDev
                 detect_usb_device(u, isOutput, deviceList->cardNumber, deviceList->deviceNumber, false);
             }
         }
-        pa_xfree(mdi->deviceList);
-        mdi->deviceList = NULL;
+        device_list_free(mdi);
     }
     if (mdi->baseName)
     {
@@ -519,7 +585,7 @@ bool init_multiple_usb_device_info(struct userdata *u, bool isOutput, int maxDev
 
     // allocate memory
     mdi->baseName = (char *)pa_xmalloc0(baseNameSize);
-    mdi->deviceList = pa_xnew(deviceInfo, mdi->maxDeviceCount);
+    mdi->deviceList = pa_xnew0(deviceInfo, mdi->maxDeviceCount);
 
     // initialize member variable
     strncpy(mdi->baseName, baseName, strlen(baseName));
@@ -649,7 +715,9 @@ bool detect_usb_device(struct userdata *u, bool isOutput, int cardNumber, int de
             {
                 deviceList->cardNumber = cardNumber;
                 deviceList->deviceNumber = deviceNumber;
-                sprintf(deviceList->cardName, "%s%d", mdi->baseName, (index));
+                snprintf(deviceList->cardName, sizeof(deviceList->cardName), "%s%d", mdi->baseName, (index));
+                free(deviceList->cardNameDetail);
+                deviceList->cardNameDetail = NULL;
                 snd_card_get_name(cardNumber, &(deviceList->cardNameDetail));
                 pa_log_info("USB %s:%s", deviceList->cardName, deviceList->cardNameDetail);
                 pa_log_info("%s, usb device module is loaded with index %u", __FUNCTION__, deviceList->alsaModule->index);
@@ -675,10 +743,7 @@ bool detect_usb_device(struct userdata *u, bool isOutput, int cardNumber, int de
         {
             // unload module
             pa_module_unload(deviceList->alsaModule, TRUE);
-            deviceList->alsaModule = NULL;
-            deviceList->cardNumber = -1;
-            deviceList->deviceNumber = -1;
-            deviceList->cardNameDetail = NULL;
+            device_slot_reset(deviceList);
             pa_log_info("%s, usb device module is unloaded", __FUNCTION__);
         }
     }
@@ -709,7 +774,6 @@ char *get_device_name_from_detail(char *deviceDetail, struct userdata *u, bool i
             {
                 if (!strncmp(u->usbOutputDeviceInfo->deviceList[i].cardNameDetail, deviceDetail, strlen(deviceDetail)))
                 {
-                    pa_log_info("logging %s %s", u->internalOutputDeviceInfo->deviceList[i].cardName, u->internalOutputDeviceInfo->deviceList[i].cardNameDetail);
                     pa_log_info("Match found for device in USB: %s : %s", deviceDetail, u->usbOutputDeviceInfo->deviceList[i].cardName);
                     return u->usbOutputDeviceInfo->deviceList[i].cardName;
                 }
@@ -720,7 +784,7 @@ char *get_device_name_from_detail(char *deviceDetail, struct userdata *u, bool i
     {
         for (int i = 0; i < u->internalInputDeviceInfo->maxDeviceCount; i++)
         {
-            pa_log_info("logging %s %s", u->internalOutputDeviceInfo->deviceList[i].cardName, u->internalOutputDeviceInfo->deviceList[i].cardNameDetail);
+            pa_log_info("logging %s %s", u->internalInputDeviceInfo->deviceList[i].cardName, u->internalInputDeviceInfo->deviceList[i].cardNameDetail);
             if (u->internalInputDeviceInfo->deviceList[i].cardNumber != -1)
             {
                 if (!strncmp(u->internalInputDeviceInfo->deviceList[i].cardNameDetail, deviceDetail, strlen(deviceDetail)))
@@ -732,7 +796,7 @@ char *get_device_name_from_detail(char *deviceDetail, struct userdata *u, bool i
         }
         for (int i = 0; i < u->usbInputDeviceInfo->maxDeviceCount; i++)
         {
-            pa_log_info("logging %s %s", u->internalOutputDeviceInfo->deviceList[i].cardName, u->internalOutputDeviceInfo->deviceList[i].cardNameDetail);
+            pa_log_info("logging %s %s", u->usbInputDeviceInfo->deviceList[i].cardName, u->usbInputDeviceInfo->deviceList[i].cardNameDetail);
             if (u->usbInputDeviceInfo->deviceList[i].cardNumber != -1)
             {
                 if (!strncmp(u->usbInputDeviceInfo->deviceList[i].cardNameDetail, deviceDetail, strlen(deviceDetail)))
@@ -1163,6 +1227,8 @@ static bool virtual_sink_input_move_outputdevice(int virtualsinkid, char *output
 
 static bool virtual_sink_input_set_ramp_volume(int sinkid, int volumetoset, int volumetable, struct userdata *u)
 {
+    if (!volume_in_range(volumetable, volumetoset))
+        return false;
     struct sinkinputnode *thelistitem = NULL;
     struct pa_cvolume cvolume, orig_cvolume;
 
@@ -1216,6 +1282,8 @@ static bool virtual_sink_input_set_ramp_volume(int sinkid, int volumetoset, int 
 
 static bool virtual_sink_input_set_volume(int sinkid, int volumetoset, int volumetable, struct userdata *u)
 {
+    if (!volume_in_range(volumetable, volumetoset))
+        return false;
     struct sinkinputnode *thelistitem = NULL;
     struct pa_cvolume cvolume;
 
@@ -1264,7 +1332,7 @@ bool close_playback_by_sink_input(int sinkInputIndex, struct userdata *u)
     pa_log_info("close_playback_by_sink_input close client associated with sinkinput index %d", sinkInputIndex);
     for (thelistitem = u->sinkinputnodelist; thelistitem != NULL; thelistitem = thelistitem->next)
     {
-        if ((thelistitem->sinkinputidx == sinkInputIndex))
+        if (thelistitem->sinkinputidx == sinkInputIndex)
         {
             pa_client_kill(thelistitem->sinkinput->client);
         }
@@ -1275,6 +1343,8 @@ bool close_playback_by_sink_input(int sinkInputIndex, struct userdata *u)
 /* set volume based on the sink index */
 static bool virtual_sink_input_index_set_volume(int sinkid, int index, int volumetoset, int volumetable, struct userdata *u)
 {
+    if (!volume_in_range(volumetable, volumetoset))
+        return false;
     struct sinkinputnode *thelistitem = NULL;
     struct pa_cvolume cvolume;
 
@@ -1318,6 +1388,8 @@ static bool virtual_sink_input_index_set_volume(int sinkid, int index, int volum
 /* set volume based on the source index */
 static void virtual_source_input_index_set_volume(int sourceId, int index, int volumetoset, int volumetable, struct userdata *u)
 {
+    if (!volume_in_range(volumetable, volumetoset))
+        return;
 
     struct sourceoutputnode *thelistitem = NULL;
     struct pa_cvolume cvolume;
@@ -1363,6 +1435,8 @@ static void virtual_source_input_index_set_volume(int sourceId, int index, int v
 
 static bool virtual_source_input_set_volume(int sourceId, int volumetoset, int volumetable, struct userdata *u)
 {
+    if (!volume_in_range(volumetable, volumetoset))
+        return false;
     struct sourceoutputnode *thelistitem = NULL;
     struct pa_cvolume cvolume;
     pa_log_debug("[%s] Requested to set volume for sourceId:%d volume:%d", __func__, sourceId, volumetoset);
@@ -1441,11 +1515,8 @@ static bool sink_set_master_volume(const char *outputdevice, int volume, struct 
     pa_assert(u);
     struct pa_cvolume cvolume;
     pa_sink *destSink = NULL;
-    if (!(MIN_VOLUME <= volume <= MAX_VOLUME))
-    {
-        pa_log_debug("Invalid volume range. set volume requested for %d", volume);
+    if (!volume_in_range(VOLUMETABLE, volume))
         return false;
-    }
     pa_log_debug("Inside sink_set_master_volume : volume requested is %d volume we are setting is %u, %f db",
                  volume,
                  pa_sw_volume_from_dB(_mapPercentToPulseRamp[VOLUMETABLE][volume]),
@@ -1469,11 +1540,8 @@ static bool source_set_master_volume(const char *source, int volume, struct user
     pa_assert(u);
     struct pa_cvolume cvolume;
     pa_source *destSource = NULL;
-    if (!(MIN_VOLUME <= volume <= MAX_VOLUME))
-    {
-        pa_log_debug("Invalid volume range. set volume requested for %d", volume);
+    if (!volume_in_range(VOLUMETABLE, volume))
         return 0;
-    }
     pa_log_debug("Inside source_set_master_volume : volume requested is %d volume we are setting is %u, %f db",
                  volume,
                  pa_sw_volume_from_dB(_mapPercentToPulseRamp[VOLUMETABLE][volume]),
@@ -1843,7 +1911,7 @@ static bool load_Bluetooth_module(struct userdata *u)
             index++;
         }
         strncat(physicalSinkBT, u->address, BLUETOOTH_MAC_ADDRESS_SIZE);
-        for (int index = 0; index < strlen(physicalSinkBT); index++)
+        for (size_t index = 0; index < strlen(physicalSinkBT); index++)
         {
             if (physicalSinkBT[index] == ':')
                 physicalSinkBT[index] = '_';
@@ -1901,6 +1969,8 @@ static bool load_lineout_alsa_sink(struct userdata *u, int soundcardNo, int devi
                 deviceList->index = i;
                 pa_log("%s, %s,%s,%d", __FUNCTION__, u->deviceName, deviceList->cardName, strlen(u->deviceName));
                 strncpy(deviceList->cardName, u->deviceName, SINK_NAME_LENGTH);
+                free(deviceList->cardNameDetail);
+                deviceList->cardNameDetail = NULL;
                 snd_card_get_name(soundcardNo, &(deviceList->cardNameDetail));
                 pa_log_info("lineout %s:%s - %d", deviceList->cardName, deviceList->cardNameDetail, strlen(deviceList->cardName));
 
@@ -1910,6 +1980,7 @@ static bool load_lineout_alsa_sink(struct userdata *u, int soundcardNo, int devi
                     pa_xfree(args);
                 if (!deviceList->alsaModule)
                 {
+                    device_slot_reset(deviceList);
                     pa_log("Error loading in module-alsa-sink for %s", u->deviceName);
                     return false;
                 }
@@ -1941,6 +2012,8 @@ static bool load_lineout_alsa_sink(struct userdata *u, int soundcardNo, int devi
                 deviceList->deviceNumber = deviceNo;
                 strncpy(deviceList->cardName, u->deviceName, SINK_NAME_LENGTH);
 
+                free(deviceList->cardNameDetail);
+                deviceList->cardNameDetail = NULL;
                 snd_card_get_name(soundcardNo, &(deviceList->cardNameDetail));
                 pa_log_info("linein %s", deviceList->cardNameDetail);
 
@@ -1951,6 +2024,7 @@ static bool load_lineout_alsa_sink(struct userdata *u, int soundcardNo, int devi
                     pa_xfree(args);
                 if (!deviceList->alsaModule)
                 {
+                    device_slot_reset(deviceList);
                     pa_log("Error loading in module-alsa-source for %s", u->deviceName);
                     return false;
                 }
@@ -2399,7 +2473,7 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
             SndHdr->param2 = CLAMP_VOLUME_TABLE(SndHdr->param2);
             ret = virtual_sink_input_index_set_volume(SndHdr->id, SndHdr->index, SndHdr->param1, SndHdr->param2, u);
             pa_log_info("parse_message: app volume command received, sink is %d sinkInputIndex:%d, requested volume is %d, headphones:%d",
-                        sinkid, SndHdr->index, SndHdr->param1, SndHdr->param2);
+                        SndHdr->id, SndHdr->index, SndHdr->param1, SndHdr->param2);
             send_callback_to_audiod(msgHdr->msgID, ret, u);
         }
         break;
@@ -2522,7 +2596,7 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
         case PAUDIOD_DEVICE_LOAD_USB_MULTIPLE_DEVICE:
         {
             // 'Z'
-            pa_log_info("received usb %s device info, deviceMaxCount:%d deviceBaseName:%s", (bool)isOutput ? "output" : "input", SndHdr->maxDeviceCnt, SndHdr->device);
+            pa_log_info("received usb %s device info, deviceMaxCount:%d deviceBaseName:%s", SndHdr->isOutput ? "output" : "input", SndHdr->maxDeviceCnt, SndHdr->device);
             ret = init_multiple_usb_device_info(u, (bool)SndHdr->isOutput, SndHdr->maxDeviceCnt, SndHdr->device);
             if (ret)
                 initialize_usb_devices(u, (bool)SndHdr->isOutput);
@@ -2597,9 +2671,7 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
         {
             // 'O'
             u->a2dpSource = SndHdr->a2dpSource;
-            pa_log_info("received command to set/reset A2DP source");
-            if (2 == sscanf(msgbuf, "%c %d", &SndHdr->Type, &u->a2dpSource))
-                pa_log_info("successfully set/reset A2DP source");
+            pa_log_info("received command to set/reset A2DP source: %d", u->a2dpSource);
         }
         break;
         case PAUDIOD_MODULE_BLUETOOTH_UNLOAD:
@@ -2653,7 +2725,7 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
             send_callback_to_audiod(msgHdr->msgID, ret, u);
         }
         break;
-        defalut:
+        default:
             pa_log_info("parse_message: unknown command received");
             break;
         }
@@ -2735,6 +2807,7 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
             break;
         }
     }
+    break;
     default:
         pa_log_info("parse_message: unknown command received");
         break;
@@ -3368,7 +3441,7 @@ static pa_hook_result_t route_sink_input_fixate_hook_callback(pa_core *c, pa_sin
                                                               struct userdata *u)
 {
 
-    int i, sink_index, volumetoset, volumetable;
+    int i, sink_index = -1, volumetoset, volumetable;
     int ismute;
     const char *type;
     struct pa_cvolume cvolume;
@@ -3381,14 +3454,18 @@ static pa_hook_result_t route_sink_input_fixate_hook_callback(pa_core *c, pa_sin
 
     for (i = 0; i < eVirtualSink_Count; i++)
     {
-        if (pa_streq(type, u->sink_mapping_table[i].virtualsinkname))
+        if (pa_safe_streq(type, u->sink_mapping_table[i].virtualsinkname))
         {
             sink_index = i;
             break;
         }
     }
-    pa_assert(sink_index >= eVirtualSink_First);
-    pa_assert(sink_index <= eVirtualSink_Last);
+    if (sink_index == -1)
+    {
+        /* not a stream type we route: leave its volume and mute alone */
+        pa_log_debug("no volume policy for stream type %s", type ? type : "(none)");
+        return PA_HOOK_OK;
+    }
 
     ismute = u->sink_mapping_table[sink_index].ismuted;
     pa_log_debug("setting mute %s for stream type %s", (ismute ? "TRUE" : "FALSE"), type);
@@ -3453,15 +3530,18 @@ static pa_hook_result_t route_sink_input_put_hook_callback(pa_core *c, pa_sink_i
     si_type = pa_proplist_gets(data->proplist, "media.type");
     for (i = 0; i < eVirtualSink_Count; i++)
     {
-        if (pa_streq(si_type, u->sink_mapping_table[i].virtualsinkname))
+        if (pa_safe_streq(si_type, u->sink_mapping_table[i].virtualsinkname))
         {
             si_data->virtualsinkid = u->sink_mapping_table[i].virtualsinkidentifier;
             break;
         }
     }
     if (si_data->virtualsinkid == -1)
+    {
+        /* not a stream type we route: nothing to track */
+        pa_xfree(si_data);
         return PA_HOOK_OK;
-    pa_assert(si_data->virtualsinkid != -1);
+    }
     pa_assert(si_data->virtualsinkid >= eVirtualSink_First);
     pa_assert(si_data->virtualsinkid <= eVirtualSink_Last);
 
@@ -3725,7 +3805,11 @@ static pa_hook_result_t route_source_output_put_hook_callback(pa_core *c, pa_sou
         return PA_HOOK_OK; /* nothing to be done for monitor source */
 
     so_type = pa_proplist_gets(so->proplist, "media.type");
-    pa_assert(so_type != NULL);
+    if (so_type == NULL)
+    {
+        pa_log_warn("source output %u has no media.type, leaving it alone", so->index);
+        return PA_HOOK_OK;
+    }
 
     node = pa_xnew0(struct sourceoutputnode, 1);
     node->virtualsourceid = -1;
@@ -3763,7 +3847,13 @@ static pa_hook_result_t route_source_output_put_hook_callback(pa_core *c, pa_sou
         }
     }
 
-    pa_assert(source_index != -1);
+    if (source_index == -1)
+    {
+        /* not a stream type we route; do not take the daemon down over it */
+        pa_log_warn("source output %u has unknown media.type %s, leaving it alone", so->index, so_type);
+        pa_xfree(node);
+        return PA_HOOK_OK;
+    }
     node->virtualsourceid = source_index;
 
     u->n_source_output_opened++;
@@ -4152,70 +4242,22 @@ void pa__done(pa_module *m)
         pa_xfree(thelistitem);
     }
 
+    /* and of source-outputs */
+    struct sourceoutputnode *node;
+    while ((node = u->sourceoutputnodelist) != NULL)
+    {
+        PA_LLIST_REMOVE(struct sourceoutputnode, u->sourceoutputnodelist, node);
+        pa_xfree(node);
+    }
+
     // free memory
-    if (u->usbOutputDeviceInfo)
-    {
-        if (u->usbOutputDeviceInfo->deviceList)
-        {
-            pa_xfree(u->usbOutputDeviceInfo->deviceList);
-            u->usbOutputDeviceInfo->deviceList = NULL;
-        }
-        if (u->usbOutputDeviceInfo->baseName)
-        {
-            pa_xfree(u->usbOutputDeviceInfo->baseName);
-            u->usbOutputDeviceInfo->baseName = NULL;
-        }
-        pa_xfree(u->usbOutputDeviceInfo);
-        u->usbOutputDeviceInfo = NULL;
-    }
+    multiple_device_info_free(&u->usbOutputDeviceInfo);
 
-    if (u->usbInputDeviceInfo)
-    {
-        if (u->usbInputDeviceInfo->deviceList)
-        {
-            pa_xfree(u->usbInputDeviceInfo->deviceList);
-            u->usbInputDeviceInfo->deviceList = NULL;
-        }
-        if (u->usbInputDeviceInfo->baseName)
-        {
-            pa_xfree(u->usbInputDeviceInfo->baseName);
-            u->usbInputDeviceInfo->baseName = NULL;
-        }
-        pa_xfree(u->usbInputDeviceInfo);
-        u->usbInputDeviceInfo = NULL;
-    }
+    multiple_device_info_free(&u->usbInputDeviceInfo);
 
-    if (u->internalInputDeviceInfo)
-    {
-        if (u->internalInputDeviceInfo->deviceList)
-        {
-            pa_xfree(u->internalInputDeviceInfo->deviceList);
-            u->internalInputDeviceInfo->deviceList = NULL;
-        }
-        if (u->internalInputDeviceInfo->baseName)
-        {
-            pa_xfree(u->internalInputDeviceInfo->baseName);
-            u->internalInputDeviceInfo->baseName = NULL;
-        }
-        pa_xfree(u->internalInputDeviceInfo);
-        u->internalInputDeviceInfo = NULL;
-    }
+    multiple_device_info_free(&u->internalInputDeviceInfo);
 
-    if (u->internalOutputDeviceInfo)
-    {
-        if (u->internalOutputDeviceInfo->deviceList)
-        {
-            pa_xfree(u->internalOutputDeviceInfo->deviceList);
-            u->internalOutputDeviceInfo->deviceList = NULL;
-        }
-        if (u->internalOutputDeviceInfo->baseName)
-        {
-            pa_xfree(u->internalOutputDeviceInfo->baseName);
-            u->internalOutputDeviceInfo->baseName = NULL;
-        }
-        pa_xfree(u->internalOutputDeviceInfo);
-        u->internalOutputDeviceInfo = NULL;
-    }
+    multiple_device_info_free(&u->internalOutputDeviceInfo);
 
     if (u->palm_policy)
         pa_palm_policy_unref(u->palm_policy);
@@ -4365,7 +4407,7 @@ pa_hook_result_t route_sink_unlink_cb(pa_core *c, pa_sink *sink, struct userdata
     {
         char *deviceNameDetail;
         char *deviceIcon;
-        if (pa_streq(sink->module->name, MODULE_ALSA_SINK_NAME))
+        if (sink->module && pa_streq(sink->module->name, MODULE_ALSA_SINK_NAME))
         {
             u->callback_deviceName = sink->name;
             deviceNameDetail = pa_proplist_gets(sink->proplist, ALSA_CARD_NAME);
@@ -4403,10 +4445,11 @@ static pa_hook_result_t source_load_subscription_callback(pa_core *c, pa_source_
 {
     pa_log_info("source_load_subscription_callback");
     pa_assert(c);
-    pa_assert(data->module);
+    pa_assert(data);
     pa_assert(u);
 
-    if (pa_streq(data->module->name, MODULE_ALSA_SOURCE_NAME))
+    /* a source need not belong to a module; only ALSA sources matter here */
+    if (data->module && pa_streq(data->module->name, MODULE_ALSA_SOURCE_NAME))
     {
         char *deviceNameDetail;
         u->callback_deviceName = data->name;
