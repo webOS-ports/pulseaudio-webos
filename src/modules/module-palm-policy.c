@@ -965,7 +965,11 @@ static bool set_source_inputdevice(struct userdata *u, char *inputdevice, int so
         destsource =
             pa_namereg_get(u->core, u->source_mapping_table[sourceId].inputdevice, PA_NAMEREG_SOURCE);
         if (destsource == NULL)
+        {
+            /* moving to no source asserts and takes the daemon down */
             pa_log_info("set_source_inputdevice destsource is null");
+            return false;
+        }
         /* walk the list of siource-inputs we know about and update their sources */
         for (thelistitem = u->sourceoutputnodelist; thelistitem != NULL; thelistitem = thelistitem->next)
         {
@@ -995,7 +999,11 @@ static bool set_sink_outputdevice(struct userdata *u, char *outputdevice, int si
         destsink =
             pa_namereg_get(u->core, u->sink_mapping_table[sinkid].outputdevice, PA_NAMEREG_SINK);
         if (destsink == NULL)
+        {
+            /* moving to no sink asserts and takes the daemon down */
             pa_log_info("set_sink_outputdevice destsink is null");
+            return false;
+        }
         /* walk the list of sink-inputs we know about and update their sinks */
         for (thelistitem = u->sinkinputnodelist; thelistitem != NULL; thelistitem = thelistitem->next)
         {
@@ -1092,7 +1100,10 @@ static bool set_default_sink_routing(struct userdata *u, int startsinkid, int en
             destsink =
                 pa_namereg_get(u->core, u->sink_mapping_table[i].outputdevice, PA_NAMEREG_SINK);
             if (destsink == NULL)
+            {
                 pa_log_info("set_default_sink_routing destsink is null");
+                continue;
+            }
             /* walk the list of sink-inputs we know about and update their sinks */
             for (thelistitem = u->sinkinputnodelist; thelistitem != NULL; thelistitem = thelistitem->next)
             {
@@ -1122,7 +1133,10 @@ static bool set_default_source_routing(struct userdata *u, int startsourceid, in
             destsource =
                 pa_namereg_get(u->core, u->source_mapping_table[i].inputdevice, PA_NAMEREG_SOURCE);
             if (destsource == NULL)
+            {
                 pa_log_info("set_default_source_routing destsource is null");
+                continue;
+            }
             /* walk the list of siource-inputs we know about and update their sources */
             for (thelistitem = u->sourceoutputnodelist; thelistitem != NULL; thelistitem = thelistitem->next)
             {
@@ -1151,6 +1165,11 @@ static bool virtual_source_output_move_inputdevice(int virtualsourceid, char *in
         pa_log_info("virtual_source_output_move_inputdevice name = %s", u->source_mapping_table[virtualsourceid].inputdevice);
         destsource =
             pa_namereg_get(u->core, u->source_mapping_table[virtualsourceid].inputdevice, PA_NAMEREG_SOURCE);
+        if (destsource == NULL)
+        {
+            pa_log_info("virtual_source_output_move_inputdevice destsource is null");
+            return false;
+        }
 
         /* walk the list of source-inputs we know about and update their sources */
         for (thelistitem = u->sourceoutputnodelist; thelistitem != NULL; thelistitem = thelistitem->next)
@@ -1204,6 +1223,7 @@ static bool virtual_sink_input_move_outputdevice(int virtualsinkid, char *output
         if (destsink == NULL)
         {
             pa_log_info("virtual_sink_input_move_outputdevice  destsink is null");
+            return false;
         }
         /* walk the list of sink-inputs we know about and update their sinks */
         for (thelistitem = u->sinkinputnodelist; thelistitem != NULL; thelistitem = thelistitem->next)
