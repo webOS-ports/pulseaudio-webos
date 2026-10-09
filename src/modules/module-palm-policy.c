@@ -3088,7 +3088,7 @@ int pa__init(pa_module *m)
     int i;
 
     pa_assert(m);
-    u = pa_xnew(struct userdata, 1);
+    u = pa_xnew0(struct userdata, 1);
 
     u->core = m->core;
     u->module = m;
