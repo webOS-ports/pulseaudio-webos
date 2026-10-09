@@ -705,7 +705,7 @@ static bool detect_usb_device(struct userdata *u, bool isOutput, int cardNumber,
     }
 
     int index;
-    if (status == 1)
+    if (status)
     {
         index = get_new_usb_device_index(mdi, cardNumber, deviceNumber);
         if (index == -1 || index >= mdi->maxDeviceCount)
@@ -2942,7 +2942,7 @@ static int make_socket(struct userdata *u)
         goto fail;
     }
 
-    u->connectionactive = FALSE;
+    u->connectionactive = false;
     u->sockev = NULL;
     u->connev = NULL;
 
@@ -3439,12 +3439,12 @@ static pa_hook_result_t route_sink_input_put_hook_callback(pa_core *c, pa_sink_i
     if (pa_proplist_gets(data->proplist, PA_PROP_PREFERRED_DEVICE))
     {
         pa_log("BYPASS enabled");
-        si_data->bypassRouting = TRUE;
+        si_data->bypassRouting = true;
     }
     else
     {
         pa_log("BYPASS disabled");
-        si_data->bypassRouting = FALSE;
+        si_data->bypassRouting = false;
     }
 
     pa_log("Sink opened with application name:%s, sink input index:%d",
@@ -3751,11 +3751,11 @@ static pa_hook_result_t route_source_output_put_hook_callback(pa_core *c, pa_sou
 
     if (pa_proplist_gets(so->proplist, PA_PROP_PREFERRED_DEVICE))
     {
-        node->bypassRouting = TRUE;
+        node->bypassRouting = true;
     }
     else
     {
-        node->bypassRouting = FALSE;
+        node->bypassRouting = false;
     }
 
     for (i = 0; i < eVirtualSource_Count; i++)
