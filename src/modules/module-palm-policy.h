@@ -20,7 +20,9 @@
 #ifndef MODULE_PALM_POLICY_H
 #define MODULE_PALM_POLICY_H
 
+#ifdef HAVE_CONFIG_H
 #include <config.h>
+#endif
 #include "module-palm-policy-default.h"
 
 #endif

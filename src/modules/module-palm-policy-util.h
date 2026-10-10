@@ -27,7 +27,7 @@
 typedef struct pa_palm_policy pa_palm_policy;
 
 typedef struct pa_palm_policy_set_param_data {
-    const char keyValuePairs[PALM_POLICY_SET_PARAM_DATA_SIZE];
+    char keyValuePairs[PALM_POLICY_SET_PARAM_DATA_SIZE];
 } pa_palm_policy_set_param_data_t;
 
 typedef enum pa_palm_policy_hook {

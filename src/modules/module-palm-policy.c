@@ -23,9 +23,7 @@
  * as determined by audioD.
  **********************************************************************/
 
-#if defined(__i386__) && defined(LOCAL_TEST_BUILD)
-#include <pulsecore/config.h> /* bit of a hack, this, I have a local copy of config.h for x86 in the /usr/include/pulsecore/ dir */
-#else
+#ifdef HAVE_CONFIG_H
 #include <config.h>
 #endif
 
@@ -35,6 +33,7 @@
 #include <stdint.h>
 #include <errno.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 #include <pulse/xmalloc.h>
 #include <pulse/mainloop.h>
@@ -58,8 +57,15 @@
 #include "module-palm-policy-tables.h"
 #include "module-palm-policy-util.h"
 
+/* Upstream PulseAudio has no such proplist key -- it is an LG addition carried in
+ * this fork's own src/pulse/proplist.h. Define it locally so the module can be
+ * built out-of-tree against an unmodified PulseAudio. Only this module reads and
+ * writes the key, so a local definition is sufficient. */
+#ifndef PA_PROP_PREFERRED_DEVICE
+#define PA_PROP_PREFERRED_DEVICE "preferred.device"
+#endif
+
 #define _MEM_ZERO(object) (memset(&(object), '\0', sizeof((object))))
-#define _NAME_STRUCT_OFFSET(struct_type, member) ((long)((unsigned char *)&((struct_type *)0)->member))
 
 #ifndef PALM_UP_RAMP_MSEC
 #define PALM_UP_RAMP_MSEC 600
@@ -124,9 +130,9 @@ struct sinkinputnode
                                * _enum_virtualsinkmap rather than a pulseaudio sink idx */
     pa_sink_input *sinkinput; /* reference to sink input with this index */
 
-    pa_bool_t paused;
+    bool paused;
 
-    pa_bool_t bypassRouting;
+    bool bypassRouting;
 
     char appname[APP_NAME_LENGTH];
 
@@ -139,9 +145,9 @@ struct sourceoutputnode
     int32_t virtualsourceid;        /* index of virtual sink it was created against, this is our index from
                                      * _enum_virtualsourcemap rather than a pulseaudio sink idx */
     pa_source_output *sourceoutput; /* reference to sink input with this index */
-    pa_bool_t paused;
+    bool paused;
 
-    pa_bool_t bypassRouting;
+    bool bypassRouting;
 
     char appname[APP_NAME_LENGTH];
 
@@ -214,7 +220,9 @@ struct userdata
     struct sockaddr_un name;    /* filename for socket */
     pa_io_event *sockev;        /* socket event handler */
     pa_io_event *connev;        /* connection event handler */
-    pa_bool_t connectionactive; /* do we have an active connection on the socket */
+    bool connectionactive; /* do we have an active connection on the socket */
+    char rxbuf[SIZE_MESG_TO_PULSE]; /* the message from audiod being received */
+    size_t rxlen;                   /* how much of it has arrived */
 
     // Maintain count of sinks opened, as sent to audiod, so that we can re-send data on reconnect for audiod to resync with us
     int32_t audiod_sink_input_opened[eVirtualSink_Count];
@@ -242,7 +250,7 @@ struct userdata
     int connectionPort;
     char *connectionType;
     char *deviceName;
-    char *callback_deviceName;
+    const char *callback_deviceName;
 
     int external_soundcard_number;
     int external_device_number;
@@ -279,13 +287,78 @@ struct userdata
     pa_palm_policy *palm_policy;
 };
 
+/* Every message to audiod is exactly SIZE_MESG_TO_AUDIOD bytes: audiod reads
+ * fixed-size records. The largest reply has to fit in one. */
+_Static_assert(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToRoutingSet) <= SIZE_MESG_TO_AUDIOD,
+               "routing reply does not fit in a message to audiod");
+_Static_assert(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToModuleSet) <= SIZE_MESG_TO_AUDIOD,
+               "module reply does not fit in a message to audiod");
+_Static_assert(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToPolicySet) <= SIZE_MESG_TO_AUDIOD,
+               "policy reply does not fit in a message to audiod");
+_Static_assert(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToAudiod) <= SIZE_MESG_TO_AUDIOD,
+               "callback reply does not fit in a message to audiod");
+
+/* Send one message to audiod: the header, the payload, and zeroes up to the
+ * fixed record size, so that nothing beyond the payload - heap or stack - goes
+ * out with it. Returns false if there is no connection or the send failed. */
+static bool send_to_audiod(struct userdata *u, uint32_t msgType, uint32_t msgID, const void *payload, size_t len)
+{
+    char buf[SIZE_MESG_TO_AUDIOD];
+    struct paudiodMsgHdr hdr;
+
+    pa_assert(u);
+    pa_assert(sizeof(hdr) + len <= sizeof(buf));
+
+    if (!u->connectionactive || u->newsockfd == -1)
+        return false;
+
+    memset(buf, 0, sizeof(buf));
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.msgType = msgType;
+    hdr.msgTmp = 0x01;
+    hdr.msgVer = 1;
+    hdr.msgLen = sizeof(hdr);
+    hdr.msgID = msgID;
+    memcpy(buf, &hdr, sizeof(hdr));
+    if (len)
+        memcpy(buf + sizeof(hdr), payload, len);
+
+    if (send(u->newsockfd, buf, sizeof(buf), MSG_NOSIGNAL) != (ssize_t)sizeof(buf))
+    {
+        pa_log("send to audiod failed: %s", strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+/* Copy a string into a fixed-size field: always terminated, truncated if it
+ * has to be, and a missing string copies as an empty one. */
+static void copy_field(char *dst, size_t size, const char *src)
+{
+    pa_assert(dst);
+    pa_assert(size > 0);
+    pa_strlcpy(dst, src ? src : "", size);
+}
+
+/* _mapPercentToPulseRamp is indexed by a volume table and a volume in
+ * percent, both of which come from audiod. */
+static bool volume_in_range(int volumetable, int volume)
+{
+    if (volumetable < 0 || volumetable >= (int)PA_ELEMENTSOF(_mapPercentToPulseRamp) ||
+        volume < MIN_VOLUME || volume > MAX_VOLUME)
+    {
+        pa_log_warn("volume %d in table %d is out of range", volume, volumetable);
+        return false;
+    }
+    return true;
+}
+
 static bool virtual_source_output_move_inputdevice(int virtualsourceid, char *inputdevice, struct userdata *u);
 
 static bool virtual_source_set_mute(int sourceid, int mute, struct userdata *u);
 
-static bool virtual_source_input_set_volume(int sinkid, int volumetoset, int volumetable, struct userdata *u);
+static bool virtual_source_input_set_volume(int sourceId, int volumetoset, int volumetable, struct userdata *u);
 
-static void virtual_source_input_set_volume_with_ramp(int sourceId, int volumetoset, int volumetable, struct userdata *u);
 
 static void virtual_source_input_index_set_volume(int sourceId, int index, int volumetoset, int volumetable, struct userdata *u);
 
@@ -321,7 +394,7 @@ static pa_hook_result_t route_sink_input_new_hook_callback(pa_core *c, pa_sink_i
 static pa_hook_result_t route_sink_input_fixate_hook_callback(pa_core *c, pa_sink_input_new_data *data,
                                                               struct userdata *u);
 
-static pa_hook_result_t route_sink_input_put_hook_callback(pa_core *c, pa_sink_input *si,
+static pa_hook_result_t route_sink_input_put_hook_callback(pa_core *c, pa_sink_input *data,
                                                            struct userdata *u);
 
 static pa_hook_result_t route_source_output_new_hook_callback(pa_core *c, pa_source_output_new_data *data,
@@ -358,20 +431,15 @@ static pa_hook_result_t route_sink_unlink_post_cb(pa_core *c, pa_sink *sink, str
 
 static pa_hook_result_t route_source_unlink_post_cb(pa_core *c, pa_source *source, struct userdata *u);
 
-static pa_hook_result_t route_source_output_state_changed_hook_callback(pa_core *c, pa_source_output *data,
+static pa_hook_result_t route_source_output_state_changed_hook_callback(pa_core *c, pa_source_output *so,
                                                                         struct userdata *u);
 
 static pa_hook_result_t route_source_output_unlink_hook_callback(pa_core *c, pa_source_output *data,
                                                                  struct userdata *u);
 
-static pa_hook_result_t route_sink_state_changed_hook_callback(pa_core *c, pa_object *o,
-                                                               struct userdata *u);
 
-static pa_bool_t sink_input_new_data_is_passthrough(pa_sink_input_new_data *data);
 
-static pa_hook_result_t sink_state_changed_cb(pa_core *c, pa_object *o, struct userdata *u);
 
-static pa_hook_result_t source_state_changed_cb(pa_core *c, pa_object *o, struct userdata *u);
 
 static bool set_source_inputdevice(struct userdata *u, char *inputdevice, int sourceId);
 
@@ -379,21 +447,78 @@ static bool set_sink_outputdevice(struct userdata *u, char *outputdevice, int si
 
 static bool set_sink_outputdevice_on_range(struct userdata *u, char *outputdevice, int startsinkid, int endsinkid);
 
-static bool set_source_inputdevice_on_range(struct userdata *u, char *outputdevice, int startsourcekid, int endsourceid);
+static bool set_source_inputdevice_on_range(struct userdata *u, char *inputdevice, int startsourceid, int endsourceid);
 
 static bool set_default_sink_routing(struct userdata *u, int startsinkid, int endsinkid);
 
 static bool set_default_source_routing(struct userdata *u, int startsourceid, int endsourceid);
 
-bool detect_usb_device(struct userdata *u, bool isOutput, int cardNumber, int deviceNumber, bool status);
+static bool detect_usb_device(struct userdata *u, bool isOutput, int cardNumber, int deviceNumber, bool status);
+
+/* The module's entry points. An in-tree build declares them in a generated
+ * symdef header; this one is built on its own. */
+const char *pa__get_author(void);
+const char *pa__get_description(void);
+const char *pa__get_version(void);
+bool pa__load_once(void);
+const char *pa__get_usage(void);
+int pa__init(pa_module *m);
+void pa__done(pa_module *m);
 
 PA_MODULE_AUTHOR("Palm, Inc.");
 PA_MODULE_DESCRIPTION("Implements policy, communication with external app is a socket at /tmp/palmaudio");
-PA_MODULE_VERSION(PACKAGE_VERSION);
+PA_MODULE_VERSION(PULSEAUDIO_VERSION);
 PA_MODULE_LOAD_ONCE(true);
 PA_MODULE_USAGE("No parameters for this module");
 
-bool initialise_internal_card(struct userdata *u, int maxDeviceCount, int isOutput)
+/* audiod says how many devices of a kind to keep slots for. Far above anything
+ * real, low enough that a bad record cannot make pa_xnew() abort the daemon. */
+#define MAX_DEVICE_COUNT 64
+
+/* Empty a device slot. Its ALSA module, if any, is the caller's to unload. */
+static void device_slot_reset(deviceInfo *d)
+{
+    d->cardNumber = -1;
+    d->deviceNumber = -1;
+    d->alsaModule = NULL;
+    free(d->cardNameDetail); /* from snd_card_get_name(), which mallocs it */
+    d->cardNameDetail = NULL;
+}
+
+/* Free a device list and everything it owns, at module unload. The ALSA
+ * modules are the core's to unload by then, so they are only forgotten. */
+static void multiple_device_info_free(multipleDeviceInfo **pmdi)
+{
+    multipleDeviceInfo *mdi = *pmdi;
+
+    if (!mdi)
+        return;
+    for (int i = 0; mdi->deviceList && i < mdi->maxDeviceCount; i++)
+        device_slot_reset(mdi->deviceList + i);
+    pa_xfree(mdi->deviceList);
+    pa_xfree(mdi->baseName);
+    pa_xfree(mdi);
+    *pmdi = NULL;
+}
+
+/* Unload what the slots of a device list hold and free the list. */
+static void device_list_free(multipleDeviceInfo *mdi)
+{
+    if (!mdi->deviceList)
+        return;
+    for (int i = 0; i < mdi->maxDeviceCount; i++)
+    {
+        deviceInfo *d = mdi->deviceList + i;
+        if (d->alsaModule)
+            pa_module_unload(d->alsaModule, true);
+        device_slot_reset(d);
+    }
+    pa_xfree(mdi->deviceList);
+    mdi->deviceList = NULL;
+    mdi->maxDeviceCount = 0;
+}
+
+static bool initialise_internal_card(struct userdata *u, int maxDeviceCount, int isOutput)
 {
     pa_assert(u);
     pa_assert(u->internalInputDeviceInfo);
@@ -403,26 +528,27 @@ bool initialise_internal_card(struct userdata *u, int maxDeviceCount, int isOutp
 
     multipleDeviceInfo *mdi = isOutput ? u->internalOutputDeviceInfo : u->internalInputDeviceInfo;
 
-    if (maxDeviceCount <= 0)
+    if (maxDeviceCount <= 0 || maxDeviceCount > MAX_DEVICE_COUNT)
     {
         pa_log_warn("Invalid max device count(%d)", maxDeviceCount);
         return false;
     }
 
+    /* audiod sends this again whenever it restarts: start from a clean list
+     * rather than leaking the old one along with the modules it holds */
+    device_list_free(mdi);
     mdi->maxDeviceCount = maxDeviceCount;
-    mdi->deviceList = pa_xnew(deviceInfo, mdi->maxDeviceCount);
+    mdi->deviceList = pa_xnew0(deviceInfo, mdi->maxDeviceCount);
     for (int i = 0; i < mdi->maxDeviceCount; i++)
     {
         deviceInfo *deviceList = (mdi->deviceList + i);
         deviceList->index = i;
-        deviceList->cardNumber = -1;
-        deviceList->deviceNumber = -1;
-        deviceList->alsaModule = NULL;
+        device_slot_reset(deviceList);
     }
     return true;
 }
 
-bool init_multiple_usb_device_info(struct userdata *u, bool isOutput, int maxDeviceCount, char *baseName)
+static bool init_multiple_usb_device_info(struct userdata *u, bool isOutput, int maxDeviceCount, char *baseName)
 {
     pa_assert(u);
     pa_assert(u->usbOutputDeviceInfo);
@@ -432,9 +558,15 @@ bool init_multiple_usb_device_info(struct userdata *u, bool isOutput, int maxDev
 
     multipleDeviceInfo *mdi = isOutput ? u->usbOutputDeviceInfo : u->usbInputDeviceInfo;
 
-    if (maxDeviceCount <= 0)
+    if (maxDeviceCount <= 0 || maxDeviceCount > MAX_DEVICE_COUNT)
     {
         pa_log_warn("Invalid max device count(%d)", maxDeviceCount);
+        return false;
+    }
+    /* each device is named <baseName><index> in a SINK_NAME_LENGTH field */
+    if (snprintf(NULL, 0, "%s%d", baseName, maxDeviceCount - 1) >= SINK_NAME_LENGTH)
+    {
+        pa_log_warn("Device base name %s is too long", baseName);
         return false;
     }
 
@@ -451,8 +583,7 @@ bool init_multiple_usb_device_info(struct userdata *u, bool isOutput, int maxDev
                 detect_usb_device(u, isOutput, deviceList->cardNumber, deviceList->deviceNumber, false);
             }
         }
-        pa_xfree(mdi->deviceList);
-        mdi->deviceList = NULL;
+        device_list_free(mdi);
     }
     if (mdi->baseName)
     {
@@ -463,14 +594,14 @@ bool init_multiple_usb_device_info(struct userdata *u, bool isOutput, int maxDev
 
     // calculate memory size
     int baseNameSize = strlen(baseName) * sizeof(char) + 1;
-    pa_log_debug("%s, memory size for base name:%d, memory size for device list:%d", __FUNCTION__, baseNameSize, (sizeof(deviceInfo) * mdi->maxDeviceCount));
+    pa_log_debug("%s, memory size for base name:%d, memory size for device list:%zu", __FUNCTION__, baseNameSize, (sizeof(deviceInfo) * (size_t)mdi->maxDeviceCount));
 
     // allocate memory
     mdi->baseName = (char *)pa_xmalloc0(baseNameSize);
-    mdi->deviceList = pa_xnew(deviceInfo, mdi->maxDeviceCount);
+    mdi->deviceList = pa_xnew0(deviceInfo, mdi->maxDeviceCount);
 
     // initialize member variable
-    strncpy(mdi->baseName, baseName, strlen(baseName));
+    memcpy(mdi->baseName, baseName, (size_t)baseNameSize);
     for (int i = 0; i < mdi->maxDeviceCount; i++)
     {
         deviceInfo *deviceList = (mdi->deviceList + i);
@@ -482,7 +613,7 @@ bool init_multiple_usb_device_info(struct userdata *u, bool isOutput, int maxDev
     return true;
 }
 
-int get_usb_device_index(multipleDeviceInfo *mdi, int cardNumber, int deviceNumber)
+static int get_usb_device_index(multipleDeviceInfo *mdi, int cardNumber, int deviceNumber)
 {
     pa_assert(mdi);
     pa_assert(mdi->deviceList);
@@ -502,7 +633,7 @@ int get_usb_device_index(multipleDeviceInfo *mdi, int cardNumber, int deviceNumb
     return -1;
 }
 
-int get_new_usb_device_index(multipleDeviceInfo *mdi, int cardNumber, int deviceNumber)
+static int get_new_usb_device_index(multipleDeviceInfo *mdi, int cardNumber, int deviceNumber)
 {
     pa_assert(mdi);
     pa_assert(mdi->deviceList);
@@ -527,7 +658,7 @@ int get_new_usb_device_index(multipleDeviceInfo *mdi, int cardNumber, int device
     return -1;
 }
 
-bool check_multiple_usb_device_info_initialization(multipleDeviceInfo *mdi)
+static bool check_multiple_usb_device_info_initialization(multipleDeviceInfo *mdi)
 {
     pa_assert(mdi);
 
@@ -538,7 +669,7 @@ bool check_multiple_usb_device_info_initialization(multipleDeviceInfo *mdi)
     return true;
 }
 
-void print_device_info(bool isOutput, multipleDeviceInfo *mdi)
+static void print_device_info(bool isOutput, multipleDeviceInfo *mdi)
 {
     pa_assert(mdi);
 
@@ -559,7 +690,7 @@ void print_device_info(bool isOutput, multipleDeviceInfo *mdi)
     }
 }
 
-bool detect_usb_device(struct userdata *u, bool isOutput, int cardNumber, int deviceNumber, bool status)
+static bool detect_usb_device(struct userdata *u, bool isOutput, int cardNumber, int deviceNumber, bool status)
 {
     pa_assert(u);
     pa_assert(u->usbOutputDeviceInfo);
@@ -574,7 +705,7 @@ bool detect_usb_device(struct userdata *u, bool isOutput, int cardNumber, int de
     }
 
     int index;
-    if (status == 1)
+    if (status)
     {
         index = get_new_usb_device_index(mdi, cardNumber, deviceNumber);
         if (index == -1 || index >= mdi->maxDeviceCount)
@@ -597,7 +728,9 @@ bool detect_usb_device(struct userdata *u, bool isOutput, int cardNumber, int de
             {
                 deviceList->cardNumber = cardNumber;
                 deviceList->deviceNumber = deviceNumber;
-                sprintf(deviceList->cardName, "%s%d", mdi->baseName, (index));
+                snprintf(deviceList->cardName, sizeof(deviceList->cardName), "%s%d", mdi->baseName, (index));
+                free(deviceList->cardNameDetail);
+                deviceList->cardNameDetail = NULL;
                 snd_card_get_name(cardNumber, &(deviceList->cardNameDetail));
                 pa_log_info("USB %s:%s", deviceList->cardName, deviceList->cardNameDetail);
                 pa_log_info("%s, usb device module is loaded with index %u", __FUNCTION__, deviceList->alsaModule->index);
@@ -623,10 +756,7 @@ bool detect_usb_device(struct userdata *u, bool isOutput, int cardNumber, int de
         {
             // unload module
             pa_module_unload(deviceList->alsaModule, TRUE);
-            deviceList->alsaModule = NULL;
-            deviceList->cardNumber = -1;
-            deviceList->deviceNumber = -1;
-            deviceList->cardNameDetail = NULL;
+            device_slot_reset(deviceList);
             pa_log_info("%s, usb device module is unloaded", __FUNCTION__);
         }
     }
@@ -634,7 +764,7 @@ bool detect_usb_device(struct userdata *u, bool isOutput, int cardNumber, int de
     return true;
 }
 
-char *get_device_name_from_detail(char *deviceDetail, struct userdata *u, bool isOutput)
+static const char *get_device_name_from_detail(const char *deviceDetail, struct userdata *u, bool isOutput)
 {
     pa_log_debug("%s, deviceDetail:%s stream", __FUNCTION__, deviceDetail);
     if (isOutput)
@@ -657,7 +787,6 @@ char *get_device_name_from_detail(char *deviceDetail, struct userdata *u, bool i
             {
                 if (!strncmp(u->usbOutputDeviceInfo->deviceList[i].cardNameDetail, deviceDetail, strlen(deviceDetail)))
                 {
-                    pa_log_info("logging %s %s", u->internalOutputDeviceInfo->deviceList[i].cardName, u->internalOutputDeviceInfo->deviceList[i].cardNameDetail);
                     pa_log_info("Match found for device in USB: %s : %s", deviceDetail, u->usbOutputDeviceInfo->deviceList[i].cardName);
                     return u->usbOutputDeviceInfo->deviceList[i].cardName;
                 }
@@ -668,7 +797,7 @@ char *get_device_name_from_detail(char *deviceDetail, struct userdata *u, bool i
     {
         for (int i = 0; i < u->internalInputDeviceInfo->maxDeviceCount; i++)
         {
-            pa_log_info("logging %s %s", u->internalOutputDeviceInfo->deviceList[i].cardName, u->internalOutputDeviceInfo->deviceList[i].cardNameDetail);
+            pa_log_info("logging %s %s", u->internalInputDeviceInfo->deviceList[i].cardName, u->internalInputDeviceInfo->deviceList[i].cardNameDetail);
             if (u->internalInputDeviceInfo->deviceList[i].cardNumber != -1)
             {
                 if (!strncmp(u->internalInputDeviceInfo->deviceList[i].cardNameDetail, deviceDetail, strlen(deviceDetail)))
@@ -680,7 +809,7 @@ char *get_device_name_from_detail(char *deviceDetail, struct userdata *u, bool i
         }
         for (int i = 0; i < u->usbInputDeviceInfo->maxDeviceCount; i++)
         {
-            pa_log_info("logging %s %s", u->internalOutputDeviceInfo->deviceList[i].cardName, u->internalOutputDeviceInfo->deviceList[i].cardNameDetail);
+            pa_log_info("logging %s %s", u->usbInputDeviceInfo->deviceList[i].cardName, u->usbInputDeviceInfo->deviceList[i].cardNameDetail);
             if (u->usbInputDeviceInfo->deviceList[i].cardNumber != -1)
             {
                 if (!strncmp(u->usbInputDeviceInfo->deviceList[i].cardNameDetail, deviceDetail, strlen(deviceDetail)))
@@ -695,7 +824,7 @@ char *get_device_name_from_detail(char *deviceDetail, struct userdata *u, bool i
     return deviceDetail;
 }
 
-void find_and_load_usb_devices(struct userdata *u, char *deviceName, snd_pcm_stream_t stream)
+static void find_and_load_usb_devices(struct userdata *u, const char *deviceName, snd_pcm_stream_t stream)
 {
     pa_assert(u);
     pa_assert(deviceName);
@@ -718,7 +847,7 @@ void find_and_load_usb_devices(struct userdata *u, char *deviceName, snd_pcm_str
     while (card >= 0)
     {
         char name[32];
-        sprintf(name, "hw:%d", card);
+        snprintf(name, sizeof(name), "hw:%d", card);
         if ((err = snd_ctl_open(&handle, name, 0)) < 0)
         {
             pa_log_warn("control open (%i): %s", card, snd_strerror(err));
@@ -733,8 +862,13 @@ void find_and_load_usb_devices(struct userdata *u, char *deviceName, snd_pcm_str
         dev = -1;
         while (1)
         {
+            /* on failure dev is left as it was: stop rather than ask for the
+             * same device again forever */
             if (snd_ctl_pcm_next_device(handle, &dev) < 0)
-                pa_log_warn("snd_ctl_pcm_next_device");
+            {
+                pa_log_warn("snd_ctl_pcm_next_device failed on card %d", card);
+                break;
+            }
             if (dev < 0)
                 break;
             snd_pcm_info_set_device(pcminfo, dev);
@@ -777,7 +911,7 @@ void find_and_load_usb_devices(struct userdata *u, char *deviceName, snd_pcm_str
     }
 }
 
-void initialize_usb_devices(struct userdata *u, bool isOutput)
+static void initialize_usb_devices(struct userdata *u, bool isOutput)
 {
     pa_assert(u);
     pa_log_info("%s, is output:%d", __FUNCTION__, isOutput);
@@ -785,7 +919,7 @@ void initialize_usb_devices(struct userdata *u, bool isOutput)
     find_and_load_usb_devices(u, "USB Audio", isOutput ? SND_PCM_STREAM_PLAYBACK : SND_PCM_STREAM_CAPTURE);
 }
 
-void check_and_remove_usb_device_module(struct userdata *u, bool isOutput, pa_module *m)
+static void check_and_remove_usb_device_module(struct userdata *u, bool isOutput, pa_module *m)
 {
     pa_assert(u);
     pa_assert(u->usbOutputDeviceInfo);
@@ -817,25 +951,6 @@ void check_and_remove_usb_device_module(struct userdata *u, bool isOutput, pa_mo
 Once it is removed, audio will be routed to HDMI.
 */
 
-static pa_bool_t sink_input_new_data_is_passthrough(pa_sink_input_new_data *data)
-{
-
-    if (pa_sink_input_new_data_is_passthrough(data))
-        return true;
-    else
-    {
-        pa_format_info *f = NULL;
-        uint32_t idx = 0;
-
-        PA_IDXSET_FOREACH(f, data->req_formats, idx)
-        {
-            if (!pa_format_info_is_pcm(f))
-                return true;
-        }
-    }
-    return false;
-}
-
 // To set the physical source(input device) for single virtual source
 static bool set_source_inputdevice(struct userdata *u, char *inputdevice, int sourceId)
 {
@@ -844,15 +959,20 @@ static bool set_source_inputdevice(struct userdata *u, char *inputdevice, int so
     struct sourceoutputnode *thelistitem = NULL;
     if (sourceId >= 0 && sourceId < eVirtualSource_Count)
     {
-        strncpy(u->source_mapping_table[sourceId].inputdevice, inputdevice, DEVICE_NAME_LENGTH);
+        copy_field(u->source_mapping_table[sourceId].inputdevice, sizeof(u->source_mapping_table[sourceId].inputdevice), inputdevice);
         pa_log_info("set_source_inputdevice setting inputdevice:%s for source:%s",
                     u->source_mapping_table[sourceId].inputdevice, u->source_mapping_table[sourceId].virtualsourcename);
         destsource =
             pa_namereg_get(u->core, u->source_mapping_table[sourceId].inputdevice, PA_NAMEREG_SOURCE);
         if (destsource == NULL)
+        {
+            /* moving to no source asserts and takes the daemon down */
             pa_log_info("set_source_inputdevice destsource is null");
+            return false;
+        }
         /* walk the list of siource-inputs we know about and update their sources */
-        for (thelistitem = u->sourceoutputnodelist; thelistitem != NULL; thelistitem = thelistitem->next)
+        struct sourceoutputnode *thelistitem_next;
+        PA_LLIST_FOREACH_SAFE(thelistitem, thelistitem_next, u->sourceoutputnodelist)
         {
             if ((int)thelistitem->virtualsourceid == sourceId && !pa_source_output_is_passthrough(thelistitem->sourceoutput))
             {
@@ -862,7 +982,10 @@ static bool set_source_inputdevice(struct userdata *u, char *inputdevice, int so
         }
     }
     else
+    {
         pa_log_warn("set_source_inputdevice: sourceId is not valid");
+        return false;
+    }
     return true;
 }
 
@@ -874,15 +997,20 @@ static bool set_sink_outputdevice(struct userdata *u, char *outputdevice, int si
     struct sinkinputnode *thelistitem = NULL;
     if (sinkid >= 0 && sinkid < eVirtualSink_Count)
     {
-        strncpy(u->sink_mapping_table[sinkid].outputdevice, outputdevice, DEVICE_NAME_LENGTH);
+        copy_field(u->sink_mapping_table[sinkid].outputdevice, sizeof(u->sink_mapping_table[sinkid].outputdevice), outputdevice);
         pa_log_info("set_sink_outputdevice setting outputdevice:%s for sink:%s",
                     u->sink_mapping_table[sinkid].outputdevice, u->sink_mapping_table[sinkid].virtualsinkname);
         destsink =
             pa_namereg_get(u->core, u->sink_mapping_table[sinkid].outputdevice, PA_NAMEREG_SINK);
         if (destsink == NULL)
+        {
+            /* moving to no sink asserts and takes the daemon down */
             pa_log_info("set_sink_outputdevice destsink is null");
+            return false;
+        }
         /* walk the list of sink-inputs we know about and update their sinks */
-        for (thelistitem = u->sinkinputnodelist; thelistitem != NULL; thelistitem = thelistitem->next)
+        struct sinkinputnode *thelistitem_next;
+        PA_LLIST_FOREACH_SAFE(thelistitem, thelistitem_next, u->sinkinputnodelist)
         {
             if ((int)thelistitem->virtualsinkid == sinkid && !pa_sink_input_is_passthrough(thelistitem->sinkinput))
             {
@@ -892,7 +1020,10 @@ static bool set_sink_outputdevice(struct userdata *u, char *outputdevice, int si
         }
     }
     else
+    {
         pa_log_warn("set_sink_outputdevice: sinkid is not valid");
+        return false;
+    }
     return true;
 }
 
@@ -906,7 +1037,7 @@ static bool set_sink_outputdevice_on_range(struct userdata *u, char *outputdevic
     {
         for (int i = startsinkid; i <= endsinkid; i++)
         {
-            strncpy(u->sink_mapping_table[i].outputdevice, outputdevice, DEVICE_NAME_LENGTH);
+            copy_field(u->sink_mapping_table[i].outputdevice, sizeof(u->sink_mapping_table[i].outputdevice), outputdevice);
             destsink = pa_namereg_get(u->core, u->sink_mapping_table[i].outputdevice, PA_NAMEREG_SINK);
 
             if (destsink == NULL)
@@ -915,7 +1046,8 @@ static bool set_sink_outputdevice_on_range(struct userdata *u, char *outputdevic
                 return false;
             }
             /* walk the list of sink-inputs we know about and update their sinks */
-            for (thelistitem = u->sinkinputnodelist; thelistitem != NULL; thelistitem = thelistitem->next)
+            struct sinkinputnode *thelistitem_next;
+            PA_LLIST_FOREACH_SAFE(thelistitem, thelistitem_next, u->sinkinputnodelist)
             {
                 if ((int)thelistitem->virtualsinkid == i && !pa_sink_input_is_passthrough(thelistitem->sinkinput) && !(thelistitem->bypassRouting))
                 {
@@ -926,7 +1058,10 @@ static bool set_sink_outputdevice_on_range(struct userdata *u, char *outputdevic
         }
     }
     else
+    {
         pa_log_warn("set_sink_outputdevice_on_range: start and end sink are not in range");
+        return false;
+    }
     return true;
 }
 
@@ -940,7 +1075,7 @@ static bool set_source_inputdevice_on_range(struct userdata *u, char *inputdevic
     {
         for (int i = startsourceid; i <= endsourceid; i++)
         {
-            strncpy(u->source_mapping_table[i].inputdevice, inputdevice, DEVICE_NAME_LENGTH);
+            copy_field(u->source_mapping_table[i].inputdevice, sizeof(u->source_mapping_table[i].inputdevice), inputdevice);
             destsource =
                 pa_namereg_get(u->core, u->source_mapping_table[i].inputdevice, PA_NAMEREG_SOURCE);
             if (destsource == NULL)
@@ -949,7 +1084,8 @@ static bool set_source_inputdevice_on_range(struct userdata *u, char *inputdevic
                 return false;
             }
             /* walk the list of siource-inputs we know about and update their sources */
-            for (thelistitem = u->sourceoutputnodelist; thelistitem != NULL; thelistitem = thelistitem->next)
+            struct sourceoutputnode *thelistitem_next;
+            PA_LLIST_FOREACH_SAFE(thelistitem, thelistitem_next, u->sourceoutputnodelist)
             {
                 if ((int)thelistitem->virtualsourceid == i && !pa_source_output_is_passthrough(thelistitem->sourceoutput) && !(thelistitem->bypassRouting))
                 {
@@ -960,7 +1096,10 @@ static bool set_source_inputdevice_on_range(struct userdata *u, char *inputdevic
         }
     }
     else
+    {
         pa_log_warn("set_source_inputdevice_on_range: start and end source are not in range");
+        return false;
+    }
     return true;
 }
 
@@ -973,13 +1112,17 @@ static bool set_default_sink_routing(struct userdata *u, int startsinkid, int en
     {
         for (int i = startsinkid; i <= endsinkid; i++)
         {
-            strncpy(u->sink_mapping_table[i].outputdevice, u->sink_mapping_table[i].virtualsinkname, DEVICE_NAME_LENGTH);
+            copy_field(u->sink_mapping_table[i].outputdevice, sizeof(u->sink_mapping_table[i].outputdevice), u->sink_mapping_table[i].virtualsinkname);
             destsink =
                 pa_namereg_get(u->core, u->sink_mapping_table[i].outputdevice, PA_NAMEREG_SINK);
             if (destsink == NULL)
+            {
                 pa_log_info("set_default_sink_routing destsink is null");
+                continue;
+            }
             /* walk the list of sink-inputs we know about and update their sinks */
-            for (thelistitem = u->sinkinputnodelist; thelistitem != NULL; thelistitem = thelistitem->next)
+            struct sinkinputnode *thelistitem_next;
+            PA_LLIST_FOREACH_SAFE(thelistitem, thelistitem_next, u->sinkinputnodelist)
             {
                 if ((int)thelistitem->virtualsinkid == i && !pa_sink_input_is_passthrough(thelistitem->sinkinput))
                 {
@@ -990,7 +1133,10 @@ static bool set_default_sink_routing(struct userdata *u, int startsinkid, int en
         }
     }
     else
+    {
         pa_log_warn("set_default_sink_routing: start and end sink are not in range");
+        return false;
+    }
     return true;
 }
 
@@ -1003,13 +1149,17 @@ static bool set_default_source_routing(struct userdata *u, int startsourceid, in
     {
         for (int i = startsourceid; i <= endsourceid; i++)
         {
-            strncpy(u->source_mapping_table[i].inputdevice, u->source_mapping_table[i].virtualsourcename, DEVICE_NAME_LENGTH);
+            copy_field(u->source_mapping_table[i].inputdevice, sizeof(u->source_mapping_table[i].inputdevice), u->source_mapping_table[i].virtualsourcename);
             destsource =
                 pa_namereg_get(u->core, u->source_mapping_table[i].inputdevice, PA_NAMEREG_SOURCE);
             if (destsource == NULL)
+            {
                 pa_log_info("set_default_source_routing destsource is null");
+                continue;
+            }
             /* walk the list of siource-inputs we know about and update their sources */
-            for (thelistitem = u->sourceoutputnodelist; thelistitem != NULL; thelistitem = thelistitem->next)
+            struct sourceoutputnode *thelistitem_next;
+            PA_LLIST_FOREACH_SAFE(thelistitem, thelistitem_next, u->sourceoutputnodelist)
             {
                 if ((int)thelistitem->virtualsourceid == i && !pa_source_output_is_passthrough(thelistitem->sourceoutput))
                 {
@@ -1020,7 +1170,10 @@ static bool set_default_source_routing(struct userdata *u, int startsourceid, in
         }
     }
     else
+    {
         pa_log_warn("set_default_source_routing: start and end source are not in range");
+        return false;
+    }
     return true;
 }
 
@@ -1032,13 +1185,19 @@ static bool virtual_source_output_move_inputdevice(int virtualsourceid, char *in
     pa_source *destsource = NULL;
     if (virtualsourceid >= 0 && virtualsourceid < eVirtualSource_Count)
     {
-        strncpy(u->source_mapping_table[virtualsourceid].inputdevice, inputdevice, DEVICE_NAME_LENGTH);
+        copy_field(u->source_mapping_table[virtualsourceid].inputdevice, sizeof(u->source_mapping_table[virtualsourceid].inputdevice), inputdevice);
         pa_log_info("virtual_source_output_move_inputdevice name = %s", u->source_mapping_table[virtualsourceid].inputdevice);
         destsource =
             pa_namereg_get(u->core, u->source_mapping_table[virtualsourceid].inputdevice, PA_NAMEREG_SOURCE);
+        if (destsource == NULL)
+        {
+            pa_log_info("virtual_source_output_move_inputdevice destsource is null");
+            return false;
+        }
 
         /* walk the list of source-inputs we know about and update their sources */
-        for (thelistitem = u->sourceoutputnodelist; thelistitem != NULL; thelistitem = thelistitem->next)
+        struct sourceoutputnode *thelistitem_next;
+        PA_LLIST_FOREACH_SAFE(thelistitem, thelistitem_next, u->sourceoutputnodelist)
         {
             if (thelistitem->virtualsourceid == virtualsourceid)
             {
@@ -1047,7 +1206,10 @@ static bool virtual_source_output_move_inputdevice(int virtualsourceid, char *in
         }
     }
     else
+    {
         pa_log("virtual_source_input_set_physical_source: source ID out of range");
+        return false;
+    }
     return true;
 }
 
@@ -1082,16 +1244,18 @@ static bool virtual_sink_input_move_outputdevice(int virtualsinkid, char *output
     pa_sink *destsink = NULL;
     if (virtualsinkid >= 0 && virtualsinkid < eVirtualSink_Count)
     {
-        strncpy(u->sink_mapping_table[virtualsinkid].outputdevice, outputdevice, DEVICE_NAME_LENGTH);
+        copy_field(u->sink_mapping_table[virtualsinkid].outputdevice, sizeof(u->sink_mapping_table[virtualsinkid].outputdevice), outputdevice);
         pa_log_info("virtual_sink_input_move_outputdevice name = %s", u->sink_mapping_table[virtualsinkid].outputdevice);
         destsink =
             pa_namereg_get(u->core, u->sink_mapping_table[virtualsinkid].outputdevice, PA_NAMEREG_SINK);
         if (destsink == NULL)
         {
             pa_log_info("virtual_sink_input_move_outputdevice  destsink is null");
+            return false;
         }
         /* walk the list of sink-inputs we know about and update their sinks */
-        for (thelistitem = u->sinkinputnodelist; thelistitem != NULL; thelistitem = thelistitem->next)
+        struct sinkinputnode *thelistitem_next;
+        PA_LLIST_FOREACH_SAFE(thelistitem, thelistitem_next, u->sinkinputnodelist)
         {
             if ((int)thelistitem->virtualsinkid == virtualsinkid && !pa_sink_input_is_passthrough(thelistitem->sinkinput))
             {
@@ -1101,7 +1265,10 @@ static bool virtual_sink_input_move_outputdevice(int virtualsinkid, char *output
         }
     }
     else
+    {
         pa_log("virtual_sink_input_move_outputdevice: sink ID out of range");
+        return false;
+    }
     return true;
 }
 
@@ -1111,8 +1278,10 @@ static bool virtual_sink_input_move_outputdevice(int virtualsinkid, char *output
 
 static bool virtual_sink_input_set_ramp_volume(int sinkid, int volumetoset, int volumetable, struct userdata *u)
 {
+    if (!volume_in_range(volumetable, volumetoset))
+        return false;
     struct sinkinputnode *thelistitem = NULL;
-    struct pa_cvolume cvolume, orig_cvolume;
+    struct pa_cvolume cvolume;
 
     if (sinkid >= 0 && sinkid < eVirtualSink_Count)
     {
@@ -1126,7 +1295,6 @@ static bool virtual_sink_input_set_ramp_volume(int sinkid, int volumetoset, int 
             {
                 if (!pa_sink_input_is_passthrough(thelistitem->sinkinput))
                 {
-                    pa_usec_t msec;
                     u->sink_mapping_table[sinkid].volumetable = volumetable;
                     pa_log_debug("volume we are setting is %u, %f db",
                                  pa_sw_volume_from_dB(_mapPercentToPulseRamp
@@ -1137,13 +1305,9 @@ static bool virtual_sink_input_set_ramp_volume(int sinkid, int volumetoset, int 
                                    pa_sw_volume_from_dB(_mapPercentToPulseRamp[volumetable]
                                                                               [volumetoset]));
 
-                    if (pa_cvolume_max(&cvolume) >=
-                        pa_cvolume_max(pa_sink_input_get_volume(thelistitem->sinkinput, &orig_cvolume, TRUE)))
-                        msec = PALM_UP_RAMP_MSEC;
-                    else
-                        msec = PALM_DOWN_RAMP_MSEC;
-
-                    /* pa_sink_input_set_volume_with_ramping(thelistitem->sinkinput, &cvolume, TRUE, TRUE, msec * PA_USEC_PER_MSEC); */
+                    /* LG's fork ramps this (PALM_UP/DOWN_RAMP_MSEC); upstream
+                     * PulseAudio has no ramped sink input volume, so it is set
+                     * directly. */
                     if (thelistitem->sinkinput->volume_writable)
                         pa_sink_input_set_volume(thelistitem->sinkinput, &cvolume, TRUE, TRUE);
                     else
@@ -1164,6 +1328,8 @@ static bool virtual_sink_input_set_ramp_volume(int sinkid, int volumetoset, int 
 
 static bool virtual_sink_input_set_volume(int sinkid, int volumetoset, int volumetable, struct userdata *u)
 {
+    if (!volume_in_range(volumetable, volumetoset))
+        return false;
     struct sinkinputnode *thelistitem = NULL;
     struct pa_cvolume cvolume;
 
@@ -1206,23 +1372,32 @@ static bool virtual_sink_input_set_volume(int sinkid, int volumetoset, int volum
     return true;
 }
 
-bool close_playback_by_sink_input(int sinkInputIndex, struct userdata *u)
+static bool close_playback_by_sink_input(int sinkInputIndex, struct userdata *u)
 {
     struct sinkinputnode *thelistitem = NULL;
+    pa_client *client = NULL;
     pa_log_info("close_playback_by_sink_input close client associated with sinkinput index %d", sinkInputIndex);
     for (thelistitem = u->sinkinputnodelist; thelistitem != NULL; thelistitem = thelistitem->next)
     {
-        if ((thelistitem->sinkinputidx == sinkInputIndex))
+        if (thelistitem->sinkinputidx == sinkInputIndex)
         {
-            pa_client_kill(thelistitem->sinkinput->client);
+            client = thelistitem->sinkinput->client;
+            break;
         }
     }
+    /* Kill outside the walk: pa_client_kill() unlinks the client's streams
+     * there and then, and route_sink_input_unlink_hook_callback() frees their
+     * nodes - the one the loop would have read ->next from among them. */
+    if (client)
+        pa_client_kill(client);
     return true;
 }
 
 /* set volume based on the sink index */
 static bool virtual_sink_input_index_set_volume(int sinkid, int index, int volumetoset, int volumetable, struct userdata *u)
 {
+    if (!volume_in_range(volumetable, volumetoset))
+        return false;
     struct sinkinputnode *thelistitem = NULL;
     struct pa_cvolume cvolume;
 
@@ -1266,6 +1441,8 @@ static bool virtual_sink_input_index_set_volume(int sinkid, int index, int volum
 /* set volume based on the source index */
 static void virtual_source_input_index_set_volume(int sourceId, int index, int volumetoset, int volumetable, struct userdata *u)
 {
+    if (!volume_in_range(volumetable, volumetoset))
+        return;
 
     struct sourceoutputnode *thelistitem = NULL;
     struct pa_cvolume cvolume;
@@ -1311,6 +1488,8 @@ static void virtual_source_input_index_set_volume(int sourceId, int index, int v
 
 static bool virtual_source_input_set_volume(int sourceId, int volumetoset, int volumetable, struct userdata *u)
 {
+    if (!volume_in_range(volumetable, volumetoset))
+        return false;
     struct sourceoutputnode *thelistitem = NULL;
     struct pa_cvolume cvolume;
     pa_log_debug("[%s] Requested to set volume for sourceId:%d volume:%d", __func__, sourceId, volumetoset);
@@ -1389,11 +1568,8 @@ static bool sink_set_master_volume(const char *outputdevice, int volume, struct 
     pa_assert(u);
     struct pa_cvolume cvolume;
     pa_sink *destSink = NULL;
-    if (!(MIN_VOLUME <= volume <= MAX_VOLUME))
-    {
-        pa_log_debug("Invalid volume range. set volume requested for %d", volume);
+    if (!volume_in_range(VOLUMETABLE, volume))
         return false;
-    }
     pa_log_debug("Inside sink_set_master_volume : volume requested is %d volume we are setting is %u, %f db",
                  volume,
                  pa_sw_volume_from_dB(_mapPercentToPulseRamp[VOLUMETABLE][volume]),
@@ -1417,11 +1593,8 @@ static bool source_set_master_volume(const char *source, int volume, struct user
     pa_assert(u);
     struct pa_cvolume cvolume;
     pa_source *destSource = NULL;
-    if (!(MIN_VOLUME <= volume <= MAX_VOLUME))
-    {
-        pa_log_debug("Invalid volume range. set volume requested for %d", volume);
+    if (!volume_in_range(VOLUMETABLE, volume))
         return 0;
-    }
     pa_log_debug("Inside source_set_master_volume : volume requested is %d volume we are setting is %u, %f db",
                  volume,
                  pa_sw_volume_from_dB(_mapPercentToPulseRamp[VOLUMETABLE][volume]),
@@ -1461,7 +1634,6 @@ static bool source_set_master_mute(const char *source, bool mute, struct userdat
 {
     pa_log_debug("Inside source_set_master_mute with source %s and mute %d", source, mute);
     pa_assert(u);
-    char *sourcename;
     pa_source *destSource = NULL;
     destSource = pa_namereg_get(u->core, source, PA_NAMEREG_SOURCE);
     if (NULL != destSource)
@@ -1472,7 +1644,7 @@ static bool source_set_master_mute(const char *source, bool mute, struct userdat
             pa_source_set_mute(destSource, UNMUTE, SAVE);
     }
     else
-        pa_log("Valid source is not present for source ID %d ", source);
+        pa_log("Valid source is not present for source %s", source);
     return true;
 }
 
@@ -1510,6 +1682,8 @@ static int sink_suspend_request(struct userdata *u)
 
 static int update_sample_spec(struct userdata *u, int rate)
 {
+    (void)u; /* the body is disabled below */
+    (void)rate;
 #if 0
     pa_sink *sink;
     pa_source *source;
@@ -1578,8 +1752,6 @@ static bool load_unicast_rtp_module(struct userdata *u)
 {
     char *args = NULL;
     pa_assert(u != NULL);
-    char audiodbuf[SIZE_MESG_TO_AUDIOD];
-    memset(audiodbuf, 0, sizeof(audiodbuf));
 
     /* Request for Unicast RTP
      * Client Provides Destination IP & Port (Optional)
@@ -1608,32 +1780,15 @@ static bool load_unicast_rtp_module(struct userdata *u)
     if (!u->rtp_module)
     {
         pa_log("Error loading in module-rtp-send");
-        // added for message Type
-        struct paudiodMsgHdr paudioReplyMsgHdr;
-        paudioReplyMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_MODULE;
-        paudioReplyMsgHdr.msgTmp = 0x01;
-        paudioReplyMsgHdr.msgVer = 1;
-        paudioReplyMsgHdr.msgLen = sizeof(struct paudiodMsgHdr);
-        paudioReplyMsgHdr.msgID = 0;
-
+        /* No address to report: the module did not load. */
         struct paReplyToModuleSet moduleSet;
+        memset(&moduleSet, 0, sizeof(moduleSet));
         moduleSet.Type = PAUDIOD_REPLY_MODULE_CAST_RTP;
         moduleSet.sink = 0;
         moduleSet.info = 1;
-        // moduleSet.ip[0];
         moduleSet.port = 0;
-        strncpy(moduleSet.ip, (char *)NULL, 50);
-        moduleSet.ip[49] = 0;
-        // moduleSet.ip[50] = {'\0'};
 
-        char *audiobuf = (char *)malloc(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToModuleSet));
-
-        // copying....
-        memcpy(audiobuf, &paudioReplyMsgHdr, sizeof(struct paudiodMsgHdr));
-        memcpy(audiobuf + sizeof(struct paudiodMsgHdr), &moduleSet, sizeof(struct paReplyToModuleSet));
-
-        // snprintf(audiodbuf, SIZE_MESG_TO_AUDIOD, "t %d %d %s %d", 0, 1, (char *)NULL, 0);
-        if (-1 == send(u->newsockfd, audiodbuf, SIZE_MESG_TO_AUDIOD, 0))
+        if (!send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_MODULE, 0, &moduleSet, sizeof(moduleSet)))
             pa_log("Failed to send message to audiod ");
         else
             pa_log("Error in Loading RTP Module message sent to audiod");
@@ -1642,61 +1797,10 @@ static bool load_unicast_rtp_module(struct userdata *u)
     return true;
 }
 
-static void load_alsa_source(struct userdata *u, int status)
-{
-    pa_assert(u);
-    char *args = NULL;
-
-    pa_log("[alsa source loading begins for Mic Recording] [AudioD sent] cardno = %d capture device number = %d",
-           u->external_soundcard_number, u->external_device_number);
-    if (u->alsa_source != NULL)
-    {
-        pa_module_unload(u->alsa_source, true);
-        u->alsa_source = NULL;
-    }
-    if (u->external_soundcard_number >= 0 && (1 == status))
-    {
-        args = pa_sprintf_malloc("device=hw:%d,%d mmap=0 source_name=%s fragment_size=4096 tsched=0",
-                                 u->external_soundcard_number, u->external_device_number, u->deviceName);
-    }
-    else if (0 == status)
-    {
-        struct stat buff = {0};
-        // Loading source on card 0.
-        if (0 == stat(DEFAULT_SOURCE_0, &buff))
-        {
-            args = pa_sprintf_malloc("device=hw:0,0 mmap=0 source_name=%s fragment_size=4096 tsched=0", u->deviceName);
-        }
-        // Loading source on card 1.
-        else if (0 == stat(DEFAULT_SOURCE_1, &buff))
-        {
-            args = pa_sprintf_malloc("device=hw:1,0 mmap=0 source_name=%s fragment_size=4096 tsched=0", u->deviceName);
-        }
-        else
-            pa_log_info("No source element found to load");
-    }
-    else
-        return;
-    if (NULL != args)
-        pa_module_load(&u->alsa_source, u->core, "module-alsa-source", args);
-
-    if (args)
-        pa_xfree(args);
-
-    if (!u->alsa_source)
-    {
-        pa_log("Error loading in module-alsa-source");
-        return;
-    }
-    pa_log_info("module-alsa-source loaded");
-}
-
 static bool load_multicast_rtp_module(struct userdata *u)
 {
     char *args = NULL;
     pa_assert(u != NULL);
-    char audiodbuf[SIZE_MESG_TO_AUDIOD];
-    memset(audiodbuf, 0, sizeof(audiodbuf));
 
     /* Request for Multicast RTP
      * Client Provides Destination IP(Optional) & Port (Optional)
@@ -1739,29 +1843,15 @@ static bool load_multicast_rtp_module(struct userdata *u)
     if (!u->rtp_module)
     {
         pa_log("Error loading in module-rtp-send");
-        // added for message Type
-        struct paudiodMsgHdr paudioReplyMsgHdr;
-        paudioReplyMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_MODULE;
-        paudioReplyMsgHdr.msgTmp = 0x01;
-        paudioReplyMsgHdr.msgVer = 1;
-        paudioReplyMsgHdr.msgLen = sizeof(struct paudiodMsgHdr);
-        paudioReplyMsgHdr.msgID = 0;
-
+        /* No address to report: the module did not load. */
         struct paReplyToModuleSet moduleSet;
+        memset(&moduleSet, 0, sizeof(moduleSet));
         moduleSet.Type = PAUDIOD_REPLY_MODULE_CAST_RTP;
         moduleSet.sink = 0;
         moduleSet.info = 1;
         moduleSet.port = 0;
-        strncpy(moduleSet.ip, (char *)NULL, 50);
-        moduleSet.ip[49] = 0;
 
-        char *audiobuf = (char *)malloc(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToModuleSet));
-
-        // copying....
-        memcpy(audiobuf, &paudioReplyMsgHdr, sizeof(struct paudiodMsgHdr));
-        memcpy(audiobuf + sizeof(struct paudiodMsgHdr), &moduleSet, sizeof(struct paReplyToModuleSet));
-        // snprintf(audiodbuf, SIZE_MESG_TO_AUDIOD, "t %d %d %s %d", 0, 1, (char *)NULL, 0);
-        if (-1 == send(u->newsockfd, audiodbuf, SIZE_MESG_TO_AUDIOD, 0))
+        if (!send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_MODULE, 0, &moduleSet, sizeof(moduleSet)))
             pa_log("Failed to send message to audiod ");
         else
             pa_log("Error in Loading RTP Module message sent to audiod");
@@ -1781,38 +1871,29 @@ static bool unload_rtp_module(struct userdata *u)
     return true;
 }
 
-void send_rtp_connection_data_to_audiod(char *ip, char *port, struct userdata *u)
+static void send_rtp_connection_data_to_audiod(const char *ip, const char *port, struct userdata *u)
 {
     pa_assert(ip);
     pa_assert(port);
-    int port_value = atoi(port);
-    char audiodbuf[SIZE_MESG_TO_AUDIOD];
-    memset(audiodbuf, 0, sizeof(audiodbuf));
+    int32_t port_value = 0;
+    if (pa_atoi(port, &port_value) < 0 || port_value < 0 || port_value > 0xFFFF)
+    {
+        pa_log_warn("[send_rtp_connection_data_to_audiod] invalid port %s", port);
+        port_value = 0;
+    }
 
-    pa_log("[send_rtp_connection_data_to_audiod] ip = %s port = %d", ip, port_value);
-    // added for message Type
-    struct paudiodMsgHdr paudioReplyMsgHdr;
-    paudioReplyMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_MODULE;
-    paudioReplyMsgHdr.msgTmp = 0x01;
-    paudioReplyMsgHdr.msgVer = 1;
-    paudioReplyMsgHdr.msgLen = sizeof(struct paudiodMsgHdr);
-    paudioReplyMsgHdr.msgID = 0;
-
+    pa_log("[send_rtp_connection_data_to_audiod] ip = %s port = %d", ip, (int)port_value);
+    /* The connection that module-rtp-send set up: its address and port, as the
+     * old text form of this message ("t 0 0 <ip> <port>") carried them. */
     struct paReplyToModuleSet moduleSet;
+    memset(&moduleSet, 0, sizeof(moduleSet));
     moduleSet.Type = PAUDIOD_REPLY_MODULE_CAST_RTP;
     moduleSet.sink = 0;
-    moduleSet.info = 1;
-    moduleSet.port = 0;
-    strncpy(moduleSet.ip, (char *)NULL, 50);
-    moduleSet.ip[49] = 0;
+    moduleSet.info = 0;
+    moduleSet.port = (uint32_t)port_value;
+    snprintf(moduleSet.ip, sizeof(moduleSet.ip), "%s", ip);
 
-    char *audiobuf = (char *)malloc(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToModuleSet));
-
-    // copying....
-    memcpy(audiobuf, &paudioReplyMsgHdr, sizeof(struct paudiodMsgHdr));
-    memcpy(audiobuf + sizeof(struct paudiodMsgHdr), &moduleSet, sizeof(struct paReplyToModuleSet));
-    // snprintf(audiodbuf, SIZE_MESG_TO_AUDIOD, "t %d %d %s %d", 0 , 0, ip, port_value);
-    if (-1 == send(u->newsockfd, audiodbuf, SIZE_MESG_TO_AUDIOD, 0))
+    if (!send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_MODULE, 0, &moduleSet, sizeof(moduleSet)))
         pa_log("Failed to send message to audiod ");
     else
         pa_log("Message sent to audiod");
@@ -1828,8 +1909,6 @@ static bool load_Bluetooth_module(struct userdata *u)
         char btSinkInit[BLUETOOTH_SINK_INIT_SIZE] = "bluez_sink.";
         btSinkInit[BLUETOOTH_SINK_INIT_SIZE - 1] = '\0';
 
-        memset(physicalSinkBT, '\0', sizeof(physicalSinkBT));
-        strncpy(physicalSinkBT, btSinkInit, sizeof(btSinkInit) - 1);
         int index = 0;
         while (u->address[index] != '\0')
         {
@@ -1839,13 +1918,13 @@ static bool load_Bluetooth_module(struct userdata *u)
             }
             index++;
         }
-        strncat(physicalSinkBT, u->address, BLUETOOTH_MAC_ADDRESS_SIZE);
-        for (int index = 0; index < strlen(physicalSinkBT); index++)
+        snprintf(physicalSinkBT, sizeof(physicalSinkBT), "%s%s", btSinkInit, u->address);
+        for (size_t j = 0; j < strlen(physicalSinkBT); j++)
         {
-            if (physicalSinkBT[index] == ':')
-                physicalSinkBT[index] = '_';
+            if (physicalSinkBT[j] == ':')
+                physicalSinkBT[j] = '_';
         }
-        strncpy(u->physicalSinkBT, physicalSinkBT, sizeof(physicalSinkBT) - 1);
+        copy_field(u->physicalSinkBT, sizeof(u->physicalSinkBT), physicalSinkBT);
         if (NULL == u->btDiscoverModule)
             pa_log_info("%s :module-bluetooth-discover loading failed", __FUNCTION__);
         else
@@ -1874,9 +1953,8 @@ static bool unload_BlueTooth_module(struct userdata *u)
 
 static bool load_lineout_alsa_sink(struct userdata *u, int soundcardNo, int deviceNo, int status, int isOutput)
 {
+    (void)status;
     pa_assert(u);
-    int sink = 0;
-    char *args = NULL;
     /* Request for lineout loading
      * Load Alsa Sink Module
      * Send Error To AudioD in case Alsa sink Load fails
@@ -1896,10 +1974,12 @@ static bool load_lineout_alsa_sink(struct userdata *u, int soundcardNo, int devi
                 deviceList->cardNumber = soundcardNo;
                 deviceList->deviceNumber = deviceNo;
                 deviceList->index = i;
-                pa_log("%s, %s,%s,%d", __FUNCTION__, u->deviceName, deviceList->cardName, strlen(u->deviceName));
-                strncpy(deviceList->cardName, u->deviceName, SINK_NAME_LENGTH);
+                pa_log("%s, %s,%s,%zu", __FUNCTION__, u->deviceName, deviceList->cardName, strlen(u->deviceName));
+                copy_field(deviceList->cardName, sizeof(deviceList->cardName), u->deviceName);
+                free(deviceList->cardNameDetail);
+                deviceList->cardNameDetail = NULL;
                 snd_card_get_name(soundcardNo, &(deviceList->cardNameDetail));
-                pa_log_info("lineout %s:%s - %d", deviceList->cardName, deviceList->cardNameDetail, strlen(deviceList->cardName));
+                pa_log_info("lineout %s:%s - %zu", deviceList->cardName, deviceList->cardNameDetail, strlen(deviceList->cardName));
 
                 args = pa_sprintf_malloc("device=hw:%d,%d mmap=0 sink_name=%s fragment_size=4096 tsched=0", soundcardNo, deviceNo, u->deviceName);
                 pa_module_load(&deviceList->alsaModule, u->core, "module-alsa-sink", args);
@@ -1907,6 +1987,7 @@ static bool load_lineout_alsa_sink(struct userdata *u, int soundcardNo, int devi
                     pa_xfree(args);
                 if (!deviceList->alsaModule)
                 {
+                    device_slot_reset(deviceList);
                     pa_log("Error loading in module-alsa-sink for %s", u->deviceName);
                     return false;
                 }
@@ -1936,8 +2017,10 @@ static bool load_lineout_alsa_sink(struct userdata *u, int soundcardNo, int devi
                 char *args = NULL;
                 deviceList->cardNumber = soundcardNo;
                 deviceList->deviceNumber = deviceNo;
-                strncpy(deviceList->cardName, u->deviceName, SINK_NAME_LENGTH);
+                copy_field(deviceList->cardName, sizeof(deviceList->cardName), u->deviceName);
 
+                free(deviceList->cardNameDetail);
+                deviceList->cardNameDetail = NULL;
                 snd_card_get_name(soundcardNo, &(deviceList->cardNameDetail));
                 pa_log_info("linein %s", deviceList->cardNameDetail);
 
@@ -1948,6 +2031,7 @@ static bool load_lineout_alsa_sink(struct userdata *u, int soundcardNo, int devi
                     pa_xfree(args);
                 if (!deviceList->alsaModule)
                 {
+                    device_slot_reset(deviceList);
                     pa_log("Error loading in module-alsa-source for %s", u->deviceName);
                     return false;
                 }
@@ -1998,14 +2082,17 @@ static bool set_audio_effect(struct userdata *u, const char* effect, int enabled
 
         pa_log_info("load-module module-preprocess %s", args);
         pa_module_load(&u->preprocess_module, u->core, "module-preprocess-source", args);
+        pa_xfree(args);
 
         struct sinkinputnode *thelistitem = NULL;
         pa_sink *destsink = NULL;
 
         destsink = pa_namereg_get(u->core, "preprocess_sink", PA_NAMEREG_SINK);
 
-        for (thelistitem = u->sinkinputnodelist; thelistitem != NULL; thelistitem = thelistitem->next) {
-            char* media_name = pa_proplist_gets(thelistitem->sinkinput->proplist, "media.name");
+        struct sinkinputnode *thelistitem_next;
+
+        PA_LLIST_FOREACH_SAFE(thelistitem, thelistitem_next, u->sinkinputnodelist) {
+            const char *media_name = pa_proplist_gets(thelistitem->sinkinput->proplist, "media.name");
             if ((media_name) && (strcmp(media_name, "preprocess Stream") == 0)) {
                 thelistitem->sinkinput->origin_sink = NULL;
                 thelistitem->sinkinput->volume_writable = true;
@@ -2032,8 +2119,10 @@ static bool set_audio_effect(struct userdata *u, const char* effect, int enabled
 
         destsource = pa_namereg_get(u->core, "preprocess-source", PA_NAMEREG_SOURCE);
 
-        for (item = u->sourceoutputnodelist; item != NULL; item = item->next) {
-            char* media_name = pa_proplist_gets(item->sourceoutput->proplist, "media.name");
+        struct sourceoutputnode *item_next;
+
+        PA_LLIST_FOREACH_SAFE(item, item_next, u->sourceoutputnodelist) {
+            const char *media_name = pa_proplist_gets(item->sourceoutput->proplist, "media.name");
             if ((media_name) && (strcmp(media_name, "preprocess Stream") == 0)) {
                 item->sourceoutput->destination_source = NULL;
                 item->sourceoutput->volume_writable = true;
@@ -2058,7 +2147,7 @@ static bool set_audio_effect(struct userdata *u, const char* effect, int enabled
     }
 
     char message[SIZE_MESG_TO_PULSE] = {0};
-    sprintf(message, "param %s %d", effect, enabled);
+    snprintf(message, sizeof(message), "param %s %d", effect, enabled);
     pa_palm_policy_set_param_data_t *spd;
     spd = pa_xnew0(pa_palm_policy_set_param_data_t, 1);
     if (spd)
@@ -2087,9 +2176,10 @@ static bool set_audio_effect(struct userdata *u, const char* effect, int enabled
 
             destsource = pa_namereg_get(u->core, u->source_mapping_table[sourceId].inputdevice, PA_NAMEREG_SOURCE);
 
-            for (item = u->sourceoutputnodelist; item != NULL; item = item->next)
+            struct sourceoutputnode *item_next;
+            PA_LLIST_FOREACH_SAFE(item, item_next, u->sourceoutputnodelist)
             {
-                char *media_name = pa_proplist_gets(item->sourceoutput->proplist, "media.name");
+                const char *media_name = pa_proplist_gets(item->sourceoutput->proplist, "media.name");
                 if ((media_name) && (strcmp(media_name, "preprocess Stream") == 0))
                 {
                 }
@@ -2138,7 +2228,7 @@ static bool set_postprocess_effect(struct userdata *u, const char* effect, int e
             return true;
         }
         u->IsDRCEnabled = enabled;
-        sprintf(message, "dynamic_range_compressor enable %d", enabled);
+        snprintf(message, sizeof(message), "dynamic_range_compressor enable %d", enabled);
     }
     else if (strcmp("equalizer", effect) == 0)
     {
@@ -2148,7 +2238,7 @@ static bool set_postprocess_effect(struct userdata *u, const char* effect, int e
             return true;
         }
         u->IsEqualizerEnabled = enabled;
-        sprintf(message, "equalizer enable %d", enabled);
+        snprintf(message, sizeof(message), "equalizer enable %d", enabled);
     }
     else if (strcmp("bass_boost", effect) == 0)
     {
@@ -2158,7 +2248,7 @@ static bool set_postprocess_effect(struct userdata *u, const char* effect, int e
             return true;
         }
         u->IsBassBoostEnabled = enabled;
-        sprintf(message, "bass_boost enable %d", enabled);
+        snprintf(message, sizeof(message), "bass_boost enable %d", enabled);
     }
 
     pa_palm_policy_set_param_data_t *spd;
@@ -2183,7 +2273,7 @@ static bool set_equalizer_param(struct userdata *u, int preset, int band, int le
     if (!u->IsEqualizerEnabled) return false;
 
     char message[SIZE_MESG_TO_PULSE] = {0};
-    sprintf(message, "equalizer param %d %d %d", preset, band, level);
+    snprintf(message, sizeof(message), "equalizer param %d %d %d", preset, band, level);
     pa_palm_policy_set_param_data_t *spd;
     spd = pa_xnew0(pa_palm_policy_set_param_data_t, 1);
     if (spd)
@@ -2196,45 +2286,46 @@ static bool set_equalizer_param(struct userdata *u, int preset, int band, int le
     return true;
 }
 
-void send_callback_to_audiod(int id, int returnVal, struct userdata *u)
+static void send_callback_to_audiod(int id, int returnVal, struct userdata *u)
 {
     pa_log_info("%s : %d,%d", __FUNCTION__, id, returnVal);
 
-    struct paudiodMsgHdr audioMsgHdr;
-    audioMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_CALLBACK;
-    audioMsgHdr.msgTmp = 0x01;
-    audioMsgHdr.msgVer = 1;
-    audioMsgHdr.msgLen = sizeof(struct paudiodMsgHdr);
-    audioMsgHdr.msgID = 0;
-
     struct paReplyToAudiod vSink;
+    memset(&vSink, 0, sizeof(vSink));
     vSink.id = id;
     vSink.returnValue = returnVal;
 
-    char *audiodbuf = (char *)malloc(sizeof(struct paReplyToAudiod) + sizeof(struct paudiodMsgHdr));
-    memcpy(audiodbuf, &audioMsgHdr, sizeof(struct paudiodMsgHdr));
-    memcpy((audiodbuf + sizeof(struct paudiodMsgHdr)), &vSink, sizeof(struct paReplyToAudiod));
-
-    if (-1 == send(u->newsockfd, audiodbuf, SIZE_MESG_TO_AUDIOD, 0))
+    if (!send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_CALLBACK, 0, &vSink, sizeof(vSink)))
         pa_log("Failed to send message to audiod from pulseaudio");
     else
         pa_log("message sent to audiod from pulseaudio");
-    return;
 }
 
 /* Parse a message sent from audiod and invoke
  * requested changes in pulseaudio
  */
+/* Every message from audiod is one record of SIZE_MESG_TO_PULSE bytes, which
+ * each of the request types has to fit in. */
+_Static_assert(sizeof(struct paudiodMsgHdr) + sizeof(struct paRoutingSet) <= SIZE_MESG_TO_PULSE, "routing request too large");
+_Static_assert(sizeof(struct paudiodMsgHdr) + sizeof(struct paVolumeSet) <= SIZE_MESG_TO_PULSE, "volume request too large");
+_Static_assert(sizeof(struct paudiodMsgHdr) + sizeof(struct paDeviceSet) <= SIZE_MESG_TO_PULSE, "device request too large");
+_Static_assert(sizeof(struct paudiodMsgHdr) + sizeof(struct paModuleSet) <= SIZE_MESG_TO_PULSE, "module request too large");
+_Static_assert(sizeof(struct paudiodMsgHdr) + sizeof(struct paParamSet) <= SIZE_MESG_TO_PULSE, "setparam request too large");
+_Static_assert(sizeof(struct paudiodMsgHdr) + sizeof(struct paEffectSet) <= SIZE_MESG_TO_PULSE, "effect request too large");
+
 static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
 {
     int HdrLen = sizeof(struct paudiodMsgHdr);
+
+    if (bufsize != SIZE_MESG_TO_PULSE)
+    {
+        pa_log("parse_message: message of %d bytes, expected %d", bufsize, SIZE_MESG_TO_PULSE);
+        return;
+    }
     pa_log_info("parse_message: paudio msg hdr length=%d", HdrLen);
     struct paudiodMsgHdr *msgHdr = (struct paudiodMsgHdr *)msgbuf;
     pa_log_info("parse_message: message type=%x, message ID=%x", msgHdr->msgType, msgHdr->msgID);
 
-    int param1, param2, param3;
-    int sinkid;
-    int sourceid;
     int ret;
 
     switch (msgHdr->msgType)
@@ -2243,9 +2334,8 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
     case PAUDIOD_MSGTYPE_ROUTING:
     {
         struct paRoutingSet *SndHdr = (struct paRoutingSet *)(msgbuf + HdrLen);
-        char device[DEVICE_NAME_LENGTH];
-        int startID;
-        int endID;
+        /* the strings come off the wire: never read past their fields */
+        SndHdr->device[sizeof(SndHdr->device) - 1] = '\0';
         pa_log_info("received source routing for device:%s startID:%d,\
                 endID:%d",
                     SndHdr->device, SndHdr->startID, SndHdr->endID);
@@ -2337,6 +2427,8 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
     case PAUDIOD_MSGTYPE_VOLUME:
     {
         struct paVolumeSet *SndHdr = (struct paVolumeSet *)(msgbuf + HdrLen);
+        /* the strings come off the wire: never read past their fields */
+        SndHdr->device[sizeof(SndHdr->device) - 1] = '\0';
         pa_log_info("parse_message: HDR Volume=%x", SndHdr->volume);
         pa_log_info("parse_message: Volume string name HDR=%d", SndHdr->Type);
         switch (SndHdr->Type)
@@ -2388,7 +2480,7 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
             SndHdr->param2 = CLAMP_VOLUME_TABLE(SndHdr->param2);
             ret = virtual_sink_input_index_set_volume(SndHdr->id, SndHdr->index, SndHdr->param1, SndHdr->param2, u);
             pa_log_info("parse_message: app volume command received, sink is %d sinkInputIndex:%d, requested volume is %d, headphones:%d",
-                        sinkid, SndHdr->index, SndHdr->param1, SndHdr->param2);
+                        SndHdr->id, SndHdr->index, SndHdr->param1, SndHdr->param2);
             send_callback_to_audiod(msgHdr->msgID, ret, u);
         }
         break;
@@ -2468,11 +2560,8 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
     case PAUDIOD_MSGTYPE_DEVICE:
     {
         struct paDeviceSet *SndHdr = (struct paDeviceSet *)(msgbuf + HdrLen);
-        int status = 0;
-        int cardNo;
-        int deviceNo;
-        char devicename[50];
-        int isOutput;
+        /* the strings come off the wire: never read past their fields */
+        SndHdr->device[sizeof(SndHdr->device) - 1] = '\0';
         pa_log_info("received lineout loading cmd from Audiod  cardno:%d,deviceno:%d,status:%d,isoutput:%d,name: %s",
                     SndHdr->cardNo, SndHdr->deviceNo, SndHdr->status, SndHdr->isOutput, u->deviceName);
         switch (SndHdr->Type)
@@ -2480,7 +2569,8 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
         case PAUDIOD_DEVICE_LOAD_LINEOUT_ALSA_SINK:
         {
             // 'i'
-            u->deviceName = SndHdr->device;
+            /* keep a copy: the record is reused for the next message */
+            copy_field(u->deviceName, DEVICE_NAME_LENGTH, SndHdr->device);
             pa_log_info("received lineout loading cmd from Audiod  cardno:%d,deviceno:%d,status:%d,isoutput:%d,name: %s",
                         SndHdr->cardNo, SndHdr->deviceNo, SndHdr->status, SndHdr->isOutput, u->deviceName);
             if (1 == SndHdr->status)
@@ -2509,7 +2599,7 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
         case PAUDIOD_DEVICE_LOAD_USB_MULTIPLE_DEVICE:
         {
             // 'Z'
-            pa_log_info("received usb %s device info, deviceMaxCount:%d deviceBaseName:%s", (bool)isOutput ? "output" : "input", SndHdr->maxDeviceCnt, SndHdr->device);
+            pa_log_info("received usb %s device info, deviceMaxCount:%d deviceBaseName:%s", SndHdr->isOutput ? "output" : "input", SndHdr->maxDeviceCnt, SndHdr->device);
             ret = init_multiple_usb_device_info(u, (bool)SndHdr->isOutput, SndHdr->maxDeviceCnt, SndHdr->device);
             if (ret)
                 initialize_usb_devices(u, (bool)SndHdr->isOutput);
@@ -2535,6 +2625,11 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
     case PAUDIOD_MSGTYPE_MODULE:
     {
         struct paModuleSet *SndHdr = (struct paModuleSet *)(msgbuf + HdrLen);
+        /* the strings come off the wire: never read past their fields */
+        SndHdr->ip[sizeof(SndHdr->ip) - 1] = '\0';
+        SndHdr->device[sizeof(SndHdr->device) - 1] = '\0';
+        SndHdr->address[sizeof(SndHdr->address) - 1] = '\0';
+        SndHdr->profile[sizeof(SndHdr->profile) - 1] = '\0';
         switch (SndHdr->Type)
         {
         case PAUDIOD_MODULE_RTP_LOAD:
@@ -2549,9 +2644,9 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
         {
             // 't'
             u->connectionPort = SndHdr->port;
-            strncpy(u->connectionType,SndHdr->device,50);// = "to fix incompatible pointer type";
+            copy_field(u->connectionType, RTP_CONNECTION_TYPE_STRING_SIZE, SndHdr->device);
             pa_log_info("received rtp load cmd from Audiod");
-            pa_log_info("parse_message:received command t FOR RTP module port = %lu", u->connectionPort);
+            pa_log_info("parse_message:received command t FOR RTP module port = %d", u->connectionPort);
             if (strcmp(u->connectionType, "unicast") == 0)
             {
                 ret = load_unicast_rtp_module(u);
@@ -2569,7 +2664,7 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
             // 'l'
             /* walk list of sink-inputs on this stream and set
              * their output sink */
-            strncpy(u->address, SndHdr->address, BLUETOOTH_MAC_ADDRESS_SIZE);
+            copy_field(u->address, sizeof(u->address), SndHdr->address);
             pa_log_info("Bluetooth connected address %s", u->address);
             ret = load_Bluetooth_module(u);
             send_callback_to_audiod(msgHdr->msgID, ret, u);
@@ -2579,9 +2674,7 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
         {
             // 'O'
             u->a2dpSource = SndHdr->a2dpSource;
-            pa_log_info("received command to set/reset A2DP source");
-            if (2 == sscanf(msgbuf, "%c %d", &SndHdr->Type, &u->a2dpSource))
-                pa_log_info("successfully set/reset A2DP source");
+            pa_log_info("received command to set/reset A2DP source: %d", u->a2dpSource);
         }
         break;
         case PAUDIOD_MODULE_BLUETOOTH_UNLOAD:
@@ -2630,12 +2723,11 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
         case PAUDIOD_SETPARAM_CLOSE_PLAYBACK:
         {
             // '7'
-            int sinkIndex;
             ret = close_playback_by_sink_input(SndHdr->ID, u);
             send_callback_to_audiod(msgHdr->msgID, ret, u);
         }
         break;
-        defalut:
+        default:
             pa_log_info("parse_message: unknown command received");
             break;
         }
@@ -2650,8 +2742,7 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
         case PAUDIOD_EFFECT_SPEECH_ENHANCEMENT_LOAD:
         {
             // '4'
-            uint32_t effectId, enabled;
-            effectId = SndHdr->id;
+            uint32_t enabled;
             enabled = SndHdr->param[0];
             ret = set_audio_effect(u, "speech_enhancement", enabled);
             send_callback_to_audiod(msgHdr->msgID, ret, u);
@@ -2659,8 +2750,7 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
         break;
         case PAUDIOD_EFFECT_GAIN_CONTROL_LOAD:
         {
-            uint32_t effectId, enabled;
-            effectId = SndHdr->id;
+            uint32_t enabled;
             enabled = SndHdr->param[0];
             ret = set_audio_effect(u, "gain_control", enabled);
             send_callback_to_audiod(msgHdr->msgID, ret, u);
@@ -2668,8 +2758,7 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
         break;
         case PAUDIOD_EFFECT_BEAMFORMING_LOAD:
         {
-            uint32_t effectId, enabled;
-            effectId = SndHdr->id;
+            uint32_t enabled;
             enabled = SndHdr->param[0];
             ret = set_audio_effect(u, "beamforming", enabled);
             send_callback_to_audiod(msgHdr->msgID, ret, u);
@@ -2677,8 +2766,7 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
         break;
         case PAUDIOD_EFFECT_DYNAMIC_COMPRESSOR_LOAD:
         {
-            uint32_t effectId, enabled;
-            effectId = SndHdr->id;
+            uint32_t enabled;
             enabled = SndHdr->param[0];
             ret = set_postprocess_effect(u, "dynamic_range_compressor", enabled);
             send_callback_to_audiod(msgHdr->msgID, ret, u);
@@ -2686,8 +2774,7 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
         break;
         case PAUDIOD_EFFECT_EQUALIZER_LOAD:
         {
-            uint32_t effectId, enabled;
-            effectId = SndHdr->id;
+            uint32_t enabled;
             enabled = SndHdr->param[0];
             ret = set_postprocess_effect(u, "equalizer", enabled);
             send_callback_to_audiod(msgHdr->msgID, ret, u);
@@ -2705,8 +2792,7 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
         break;
         case PAUDIOD_EFFECT_BASS_BOOST_LOAD:
         {
-            uint32_t effectId, enabled;
-            effectId = SndHdr->id;
+            uint32_t enabled;
             enabled = SndHdr->param[0];
             ret = set_postprocess_effect(u, "bass_boost", enabled);
             send_callback_to_audiod(msgHdr->msgID, ret, u);
@@ -2717,6 +2803,7 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
             break;
         }
     }
+    break;
     default:
         pa_log_info("parse_message: unknown command received");
         break;
@@ -2728,27 +2815,23 @@ static void parse_message(char *msgbuf, int bufsize, struct userdata *u)
  * appropriate IO event handler */
 static void handle_io_event_socket(pa_mainloop_api *ea, pa_io_event *e, int fd, pa_io_event_flags_t events, void *userdata)
 {
+    (void)ea;
+    (void)e;
     struct userdata *u = userdata;
-    int itslen;
+    struct sockaddr_un peer;
+    socklen_t peerlen = sizeof(peer);
     int sink;
     int source;
-    char audiodbuf[SIZE_MESG_TO_AUDIOD];
 
     pa_assert(u);
     pa_assert(fd == u->sockfd);
 
-    itslen = SUN_LEN(&u->name);
-
-    if (events & PA_IO_EVENT_NULL)
-    {
-        pa_log_info("handle_io_event_socket PA_IO_EVENT_NULL received");
-    }
     if (events & PA_IO_EVENT_INPUT)
     {
         /* do we have a connection on our socket yet? */
         if (-1 == u->newsockfd)
         {
-            if (-1 == (u->newsockfd = accept(u->sockfd, &(u->name), &itslen)))
+            if (-1 == (u->newsockfd = accept(u->sockfd, (struct sockaddr *)&peer, &peerlen)))
             {
                 pa_log_info("handle_io_event_socket could not create new connection on socket:%s", strerror(errno));
             }
@@ -2761,6 +2844,7 @@ static void handle_io_event_socket(pa_mainloop_api *ea, pa_io_event *e, int fd, 
                                                   PA_IO_EVENT_HANGUP | PA_IO_EVENT_ERROR,
                                               handle_io_event_connection, u);
                 u->connectionactive = true; /* flag that we have an active connection */
+                u->rxlen = 0;
 
                 // TODO to check if we need to send sink input index and corresponding app name with one more loop for both sink and source
                 /* Tell audiod how many sink of each category is opened */
@@ -2768,27 +2852,14 @@ static void handle_io_event_socket(pa_mainloop_api *ea, pa_io_event *e, int fd, 
                 {
                     if (u->audiod_sink_input_opened[sink] > 0)
                     {
-                        // added for message Type
-                        struct paudiodMsgHdr paudioReplyMsgHdr;
-                        paudioReplyMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_POLICY;
-                        paudioReplyMsgHdr.msgTmp = 0x01;
-                        paudioReplyMsgHdr.msgVer = 1;
-                        paudioReplyMsgHdr.msgLen = sizeof(struct paudiodMsgHdr);
-                        paudioReplyMsgHdr.msgID = 0;
-
                         struct paReplyToPolicySet policySet;
+                        memset(&policySet, 0, sizeof(policySet));
                         policySet.Type = PAUDIOD_REPLY_POLICY_SINK_CATEGORY;
                         policySet.stream = sink;
                         policySet.count = u->audiod_sink_input_opened[sink];
 
-                        char *audiobuf = (char *)malloc(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToPolicySet));
-
-                        // copying....
-                        memcpy(audiobuf, &paudioReplyMsgHdr, sizeof(struct paudiodMsgHdr));
-                        memcpy(audiobuf + sizeof(struct paudiodMsgHdr), &policySet, sizeof(struct paReplyToPolicySet));
-
-                        if (-1 == send(u->newsockfd, audiodbuf, SIZE_MESG_TO_AUDIOD, 0))
-                            pa_log("handle_io_event_socket: send failed: %s", strerror(errno));
+                        if (!send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_POLICY, 0, &policySet, sizeof(policySet)))
+                            pa_log("handle_io_event_socket: send failed");
                         else
                             pa_log_info("handle_io_event_socket: stream count for sink %d (%d)",
                                         sink, u->audiod_sink_input_opened[sink]);
@@ -2800,25 +2871,14 @@ static void handle_io_event_socket(pa_mainloop_api *ea, pa_io_event *e, int fd, 
                 {
                     if (u->audiod_source_output_opened[source] > 0)
                     {
-                        // added for message Type
-                        struct paudiodMsgHdr paudioReplyMsgHdr;
-                        paudioReplyMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_POLICY;
-                        paudioReplyMsgHdr.msgTmp = 0x01;
-                        paudioReplyMsgHdr.msgVer = 1;
-                        paudioReplyMsgHdr.msgLen = sizeof(struct paudiodMsgHdr);
-                        paudioReplyMsgHdr.msgID = 0;
-
                         struct paReplyToPolicySet policySet;
+                        memset(&policySet, 0, sizeof(policySet));
                         policySet.Type = PAUDIOD_REPLY_POLICY_SOURCE_CATEGORY;
                         policySet.stream = source;
                         policySet.count = u->audiod_source_output_opened[source];
-                        char *audiobuf = (char *)malloc(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToPolicySet));
-                        // copying....
-                        memcpy(audiobuf, &paudioReplyMsgHdr, sizeof(struct paudiodMsgHdr));
-                        memcpy(audiobuf + sizeof(struct paudiodMsgHdr), &policySet, sizeof(struct paReplyToPolicySet));
 
-                        if (-1 == send(u->newsockfd, audiobuf, SIZE_MESG_TO_AUDIOD, 0))
-                            pa_log("handle_io_event_socket: send failed: %s", strerror(errno));
+                        if (!send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_POLICY, 0, &policySet, sizeof(policySet)))
+                            pa_log("handle_io_event_socket: send failed");
                         else
                             pa_log_info("handle_io_event_socket: stream count for source %d (%d)",
                                         source, u->audiod_source_output_opened[source]);
@@ -2836,61 +2896,71 @@ static void handle_io_event_socket(pa_mainloop_api *ea, pa_io_event *e, int fd, 
  * client (audiod).  This routine will createlisten on
  * the socket and parse and act upon messages sent to
  * the socket connection */
+/* Tear down the connection to audiod, so that a new one can be accepted. */
+static void close_connection(struct userdata *u)
+{
+    pa_assert(u);
+
+    if (u->connev)
+    {
+        /* remove ourselves from the IO list on the main loop */
+        u->core->mainloop->io_free(u->connev);
+        u->connev = NULL;
+    }
+    if (u->newsockfd != -1)
+    {
+        if (-1 == shutdown(u->newsockfd, SHUT_RDWR))
+            pa_log_info("Error in shutdown (%d):%s", errno, strerror(errno));
+        if (-1 == close(u->newsockfd))
+            pa_log_info("Error in close (%d):%s", errno, strerror(errno));
+        u->newsockfd = -1;
+    }
+    u->connectionactive = false;
+    u->rxlen = 0;
+}
+
 static void handle_io_event_connection(pa_mainloop_api *ea, pa_io_event *e, int fd, pa_io_event_flags_t events, void *userdata)
 {
+    (void)ea;
+    (void)e;
     struct userdata *u = userdata;
-    char buf[SIZE_MESG_TO_PULSE];
-    int bytesread;
+    ssize_t bytesread;
 
     pa_assert(u);
     pa_assert(fd == u->newsockfd);
 
-    if (events & PA_IO_EVENT_NULL)
-    {
-        pa_log_info("handle_io_event_connection PA_IO_EVENT_NULL received");
-    }
     if (events & PA_IO_EVENT_INPUT)
     {
-        if (-1 == (bytesread = recv(u->newsockfd, buf, SIZE_MESG_TO_PULSE, 0)))
+        /* audiod sends fixed records of SIZE_MESG_TO_PULSE bytes over a stream
+         * socket, which may deliver one in pieces: collect a whole record
+         * before acting on it. */
+        bytesread = recv(u->newsockfd, u->rxbuf + u->rxlen, sizeof(u->rxbuf) - u->rxlen, 0);
+        if (bytesread < 0)
         {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+                return;
             pa_log_info("handle_io_event_connection Error in recv (%d): %s ", errno, strerror(errno));
+            close_connection(u);
+            return;
         }
-        else
+        if (bytesread == 0)
         {
-            if (bytesread != 0)
-            { /* the socket connection will return zero bytes on EOF */
-                parse_message(buf, SIZE_MESG_TO_PULSE, u);
-            }
+            pa_log_info("handle_io_event_connection audiod closed the connection");
+            close_connection(u);
+            return;
+        }
+        u->rxlen += (size_t)bytesread;
+        if (u->rxlen == sizeof(u->rxbuf))
+        {
+            u->rxlen = 0;
+            parse_message(u->rxbuf, sizeof(u->rxbuf), u);
         }
     }
-    if (events & PA_IO_EVENT_OUTPUT)
+    if (events & (PA_IO_EVENT_HANGUP | PA_IO_EVENT_ERROR))
     {
-        pa_log_info("handle_io_event_connection PA_IO_EVENT_OUTPUT received");
+        pa_log_info("handle_io_event_connection Socket is being closed (events 0x%x)", (unsigned)events);
+        close_connection(u);
     }
-    if (events & PA_IO_EVENT_HANGUP)
-    {
-        pa_log_info("handle_io_event_connection PA_IO_EVENT_HANGUP received");
-        pa_log_info("handle_io_event_connection Socket is being closed");
-        /* remove ourselves from the IO list on the main loop */
-        u->core->mainloop->io_free(u->connev);
-
-        /* tear down the connection */
-        if (-1 == shutdown(u->newsockfd, SHUT_RDWR))
-        {
-            pa_log_info("Error in shutdown (%d):%s", errno, strerror(errno));
-        }
-        if (-1 == close(u->newsockfd))
-        {
-            pa_log_info("Error in close (%d):%s", errno, strerror(errno));
-        }
-
-        /* reset vars in userdata, allows another connection to be rebuilt */
-        u->connectionactive = false;
-        u->connev = NULL;
-        u->newsockfd = -1;
-    }
-    if (events & PA_IO_EVENT_ERROR)
-        pa_log_info("handle_io_event_connection PA_IO_EVENT_ERROR received");
 }
 
 static int make_socket(struct userdata *u)
@@ -2911,7 +2981,8 @@ static int make_socket(struct userdata *u)
 
     if (path_len > _MAX_NAME_LEN)
     {
-        pa_log("%s: Path name is too long '%s'\n", __FUNCTION__, strerror(errno));
+        pa_log("%s: socket name is too long", __FUNCTION__);
+        goto fail;
     }
 
     strncpy(&u->name.sun_path[1], PALMAUDIO_SOCK_NAME, path_len);
@@ -2925,7 +2996,7 @@ static int make_socket(struct userdata *u)
 
     /* bind it to a name */
     if (-1 ==
-        bind(u->sockfd, (struct sockaddr *)&(u->name), _NAME_STRUCT_OFFSET(struct sockaddr_un, sun_path) + path_len))
+        bind(u->sockfd, (struct sockaddr *)&(u->name), (socklen_t)(offsetof(struct sockaddr_un, sun_path) + (size_t)path_len)))
     {
         pa_log("Error in bind (%d) ", errno);
         goto fail;
@@ -2937,7 +3008,7 @@ static int make_socket(struct userdata *u)
         goto fail;
     }
 
-    u->connectionactive = FALSE;
+    u->connectionactive = false;
     u->sockev = NULL;
     u->connev = NULL;
 
@@ -2950,6 +3021,11 @@ static int make_socket(struct userdata *u)
                                   handle_io_event_socket, u);
     return 0;
 fail:
+    if (u->sockfd != -1)
+    {
+        close(u->sockfd);
+        u->sockfd = -1;
+    }
     return -1;
 }
 
@@ -3073,20 +3149,45 @@ static void disconnect_hooks(struct userdata *u)
 
     if (u->sink_unlink)
         pa_hook_slot_free(u->sink_unlink);
+
+    /* These were connected in pa__init() but never let go of: once the
+     * module was unloaded, the next module, sink or source to come or go -
+     * at shutdown, every one unloaded after this module - called back into
+     * the freed userdata. */
+    if (u->sink_unlink_post)
+        pa_hook_slot_free(u->sink_unlink_post);
+
+    if (u->source_unlink_post)
+        pa_hook_slot_free(u->source_unlink_post);
+
+    if (u->module_load_hook_slot)
+        pa_hook_slot_free(u->module_load_hook_slot);
+
+    if (u->module_unload_hook_slot)
+        pa_hook_slot_free(u->module_unload_hook_slot);
+
+    if (u->sink_load_hook_slot)
+        pa_hook_slot_free(u->sink_load_hook_slot);
+
+    if (u->source_load_hook_slot)
+        pa_hook_slot_free(u->source_load_hook_slot);
 }
 
 /* entry point for the module*/
-int pa__init(pa_module *m)
+/* The module's state, set up as pa__init() needs it but without hooks, socket
+ * or shared objects - so that tests can build one around a core of their own. */
+static struct userdata *userdata_new(pa_core *core, pa_module *m)
 {
     struct userdata *u = NULL;
     int i;
 
-    pa_assert(m);
-    u = pa_xnew(struct userdata, 1);
+    u = pa_xnew0(struct userdata, 1);
 
-    u->core = m->core;
+    u->core = core;
     u->module = m;
-    m->userdata = u;
+    /* no socket and no connection yet, whatever pa__done() is reached from */
+    u->sockfd = -1;
+    u->newsockfd = -1;
 
     u->alsa_sink1 = NULL;
     u->alsa_sink2 = NULL;
@@ -3095,14 +3196,12 @@ int pa__init(pa_module *m)
     PA_LLIST_HEAD_INIT(struct sinkinputnode, u->sinkinputnodelist);
     PA_LLIST_HEAD_INIT(struct sourceoutputnode, u->sourceoutputnodelist);
 
-    connect_to_hooks(u);
-
     /* copy the default sink mapping */
     for (i = 0; i < eVirtualSink_Count; i++)
     {
         u->sink_mapping_table[i].virtualsinkname = virtualsinkmap[i].virtualsinkname;
         u->sink_mapping_table[i].virtualsinkidentifier = virtualsinkmap[i].virtualsinkidentifier;
-        strncpy(u->sink_mapping_table[i].outputdevice, virtualsinkmap[i].outputdevice, DEVICE_NAME_LENGTH);
+        copy_field(u->sink_mapping_table[i].outputdevice, sizeof(u->sink_mapping_table[i].outputdevice), virtualsinkmap[i].outputdevice);
         u->sink_mapping_table[i].volumetable = virtualsinkmap[i].volumetable;
         u->sink_mapping_table[i].volume = virtualsinkmap[i].volume;
         u->sink_mapping_table[i].ismuted = virtualsinkmap[i].ismuted;
@@ -3123,7 +3222,7 @@ int pa__init(pa_module *m)
     {
         u->source_mapping_table[i].virtualsourcename = virtualsourcemap[i].virtualsourcename;
         u->source_mapping_table[i].virtualsourceidentifier = virtualsourcemap[i].virtualsourceidentifier;
-        strncpy(u->source_mapping_table[i].inputdevice, virtualsourcemap[i].inputdevice, DEVICE_NAME_LENGTH);
+        copy_field(u->source_mapping_table[i].inputdevice, sizeof(u->source_mapping_table[i].inputdevice), virtualsourcemap[i].inputdevice);
         u->source_mapping_table[i].volume = virtualsourcemap[i].volume;
         u->source_mapping_table[i].ismuted = virtualsourcemap[i].ismuted;
         u->source_mapping_table[i].volumetable = virtualsourcemap[i].volumetable;
@@ -3150,7 +3249,8 @@ int pa__init(pa_module *m)
     u->connectionType = (char *)pa_xmalloc0(RTP_CONNECTION_TYPE_STRING_SIZE);
     u->connectionPort = 0;
     u->deviceName = (char *)pa_xmalloc0(DEVICE_NAME_LENGTH);
-    u->callback_deviceName = (char *)pa_xmalloc0(DEVICE_NAME_LENGTH);
+    /* only ever borrows the name of the sink or source being reported */
+    u->callback_deviceName = NULL;
 
     u->btDiscoverModule = NULL;
     u->IsBluetoothEnabled = false;
@@ -3180,6 +3280,19 @@ int pa__init(pa_module *m)
     u->internalOutputDeviceInfo->baseName = NULL;
     u->internalOutputDeviceInfo->maxDeviceCount = 0;
     u->internalOutputDeviceInfo->deviceList = NULL;
+
+    return u;
+}
+
+int pa__init(pa_module *m)
+{
+    struct userdata *u;
+
+    pa_assert(m);
+    u = userdata_new(m->core, m);
+    m->userdata = u;
+
+    connect_to_hooks(u);
 
     if (!(u->palm_policy = pa_palm_policy_get(u->core)))
     {
@@ -3212,12 +3325,12 @@ static pa_hook_result_t route_sink_input_new_hook_callback(pa_core *c, pa_sink_i
 
     type = pa_proplist_new();
 
-    char *media_name = pa_proplist_gets(data->proplist, "media.name");
+    const char *media_name = pa_proplist_gets(data->proplist, "media.name");
     // For handling void stream
-    char *pref_device = pa_proplist_gets(data->proplist, PA_PROP_PREFERRED_DEVICE);
+    const char *pref_device = pa_proplist_gets(data->proplist, PA_PROP_PREFERRED_DEVICE);
     if (data->sink != NULL && pref_device != NULL)
     {
-        char *actualDeviceName = get_device_name_from_detail(pref_device, u, true);
+        const char *actualDeviceName = get_device_name_from_detail(pref_device, u, true);
         pa_proplist_sets(type, "media.type", data->sink->name);
         pa_proplist_update(data->proplist, PA_UPDATE_MERGE, type);
         if (actualDeviceName)
@@ -3243,41 +3356,34 @@ static pa_hook_result_t route_sink_input_new_hook_callback(pa_core *c, pa_sink_i
     {
         /* redirect everything to the default application stream */
         pa_log_info("THE DEFAULT DEVICE WAS USED TO CREATE THIS STREAM - PLEASE CATEGORIZE USING A VIRTUAL STREAM");
-        char *si_type = pa_proplist_gets(data->proplist, "media.role");
-        if ((si_type) && (0 == strncmp(si_type, "music", 5)))
+        const char *role = pa_proplist_gets(data->proplist, "media.role");
+        const char *virtualsink;
+        /* LG's fork meant streams of the music role for btstream (A2DP),
+         * but that branch fell through into the default one, so they have
+         * always gone to pdefaultapp - which is also what webOS's own
+         * module-palm-policy did: its new-stream hook has no role routing
+         * and puts every stream that comes without a sink on the default
+         * application sink. audiod routes btstream no differently and only
+         * keeps a volume policy for it. Only the phone role goes elsewhere. */
+        if (role && 0 == strncmp(role, "phone", 5))
         {
-            pa_proplist_sets(type, "media.type", "btstream");
-            pa_proplist_update(data->proplist, PA_UPDATE_MERGE, type);
-            char *si_type = pa_proplist_gets(data->proplist, "media.type");
-            sink = pa_namereg_get(c, "btstream", PA_NAMEREG_SINK);
-            pa_assert(sink != NULL);
-            data->sink = sink;
-            sink = NULL;
-            sink_index = ebtstream;
-            pa_log_info("A2DP source media type %s sink-name %s", si_type, data->sink->name);
-        }
-        if ((si_type) && (0 == strncmp(si_type, "phone", 5)))
-        {
-            pa_proplist_sets(type, "media.type", "btcall");
-            pa_proplist_update(data->proplist, PA_UPDATE_MERGE, type);
-            char *si_type = pa_proplist_gets(data->proplist, "media.type");
-            sink = pa_namereg_get(c, "btcall", PA_NAMEREG_SINK);
-            pa_assert(sink != NULL);
-            data->sink = sink;
-            sink = NULL;
+            virtualsink = "btcall";
             sink_index = ebtcall;
-            pa_log_info("HFP call  media type %s sink-name %s", si_type, data->sink->name);
         }
         else
         {
+            virtualsink = "pdefaultapp";
             sink_index = edefaultapp;
-            pa_proplist_sets(type, "media.type", "pdefaultapp");
-            pa_proplist_update(data->proplist, PA_UPDATE_MERGE, type);
-            sink = pa_namereg_get(c, "pdefaultapp", PA_NAMEREG_SINK);
-            pa_assert(sink != NULL);
-            data->sink = sink;
-            sink = NULL;
         }
+        pa_proplist_sets(type, "media.type", virtualsink);
+        pa_proplist_update(data->proplist, PA_UPDATE_MERGE, type);
+        sink = pa_namereg_get(c, virtualsink, PA_NAMEREG_SINK);
+        if (sink)
+            data->sink = sink;
+        else
+            pa_log_warn("virtual sink %s does not exist", virtualsink);
+        pa_log_info("stream of role %s goes to %s", role ? role : "(none)", virtualsink);
+        sink = NULL;
 
         sink = pa_namereg_get(c, u->sink_mapping_table[sink_index].outputdevice, PA_NAMEREG_SINK);
 
@@ -3301,7 +3407,7 @@ static pa_hook_result_t route_sink_input_new_hook_callback(pa_core *c, pa_sink_i
     else if ((NULL != data->sink) && sink_index == edefaultapp && (!(pa_streq(data->sink->driver, MODULE_NULL_SINK))))
     {
         pa_log_info("data->sink->name : %s", data->sink->name);
-        char *app_name = pa_proplist_gets(data->proplist, PA_PROP_APPLICATION_NAME);
+        const char *app_name = pa_proplist_gets(data->proplist, PA_PROP_APPLICATION_NAME);
         if (app_name && !strncmp(app_name, "Chromium", strlen("Chromium")))
         {
             pa_proplist_sets(type, "media.type", "voipcall");
@@ -3336,17 +3442,18 @@ static pa_hook_result_t route_sink_input_new_hook_callback(pa_core *c, pa_sink_i
             }
         }
 
-        sink = pa_namereg_get(c, u->sink_mapping_table[i].outputdevice, PA_NAMEREG_SINK);
-
-        pa_log_info("routing to device:%s", u->sink_mapping_table[i].outputdevice);
-        if (pa_streq(data->sink->name, u->sink_mapping_table[i].virtualsinkname))
+        if (i < eVirtualSink_Count)
         {
-            pa_assert(sink != NULL);
-            data->sink = sink;
-            sink = NULL;
-            if (sink && PA_SINK_IS_LINKED(sink->state))
-                pa_sink_input_new_data_set_sink(data, sink, FALSE, FALSE);
+            /* opened on a virtual sink: route it to where that sink goes */
+            sink = pa_namereg_get(c, u->sink_mapping_table[i].outputdevice, PA_NAMEREG_SINK);
+            pa_log_info("routing to device:%s", u->sink_mapping_table[i].outputdevice);
+            if (sink)
+                data->sink = sink;
+            else
+                pa_log_warn("no sink %s to route %s to", u->sink_mapping_table[i].outputdevice, data->sink->name);
         }
+        else
+            pa_log_debug("%s is not a virtual sink, leaving the stream on it", data->sink->name);
     }
     if (type)
         pa_proplist_free(type);
@@ -3358,7 +3465,7 @@ static pa_hook_result_t route_sink_input_fixate_hook_callback(pa_core *c, pa_sin
                                                               struct userdata *u)
 {
 
-    int i, sink_index, volumetoset, volumetable;
+    int i, sink_index = -1, volumetoset, volumetable;
     int ismute;
     const char *type;
     struct pa_cvolume cvolume;
@@ -3371,14 +3478,18 @@ static pa_hook_result_t route_sink_input_fixate_hook_callback(pa_core *c, pa_sin
 
     for (i = 0; i < eVirtualSink_Count; i++)
     {
-        if (pa_streq(type, u->sink_mapping_table[i].virtualsinkname))
+        if (pa_safe_streq(type, u->sink_mapping_table[i].virtualsinkname))
         {
             sink_index = i;
             break;
         }
     }
-    pa_assert(sink_index >= eVirtualSink_First);
-    pa_assert(sink_index <= eVirtualSink_Last);
+    if (sink_index == -1)
+    {
+        /* not a stream type we route: leave its volume and mute alone */
+        pa_log_debug("no volume policy for stream type %s", type ? type : "(none)");
+        return PA_HOOK_OK;
+    }
 
     ismute = u->sink_mapping_table[sink_index].ismuted;
     pa_log_debug("setting mute %s for stream type %s", (ismute ? "TRUE" : "FALSE"), type);
@@ -3420,22 +3531,22 @@ static pa_hook_result_t route_sink_input_put_hook_callback(pa_core *c, pa_sink_i
     if (pa_proplist_gets(data->proplist, PA_PROP_APPLICATION_NAME) == NULL)
     {
         pa_log("Sink opened, application.name not a VALID key..hence adding empty name");
-        strncpy(si_data->appname, "", APP_NAME_LENGTH);
+        copy_field(si_data->appname, sizeof(si_data->appname), "");
     }
     else
     {
-        strncpy(si_data->appname, pa_proplist_gets(data->proplist, PA_PROP_APPLICATION_NAME), APP_NAME_LENGTH);
+        copy_field(si_data->appname, sizeof(si_data->appname), pa_proplist_gets(data->proplist, PA_PROP_APPLICATION_NAME));
     }
 
     if (pa_proplist_gets(data->proplist, PA_PROP_PREFERRED_DEVICE))
     {
         pa_log("BYPASS enabled");
-        si_data->bypassRouting = TRUE;
+        si_data->bypassRouting = true;
     }
     else
     {
         pa_log("BYPASS disabled");
-        si_data->bypassRouting = FALSE;
+        si_data->bypassRouting = false;
     }
 
     pa_log("Sink opened with application name:%s, sink input index:%d",
@@ -3443,15 +3554,18 @@ static pa_hook_result_t route_sink_input_put_hook_callback(pa_core *c, pa_sink_i
     si_type = pa_proplist_gets(data->proplist, "media.type");
     for (i = 0; i < eVirtualSink_Count; i++)
     {
-        if (pa_streq(si_type, u->sink_mapping_table[i].virtualsinkname))
+        if (pa_safe_streq(si_type, u->sink_mapping_table[i].virtualsinkname))
         {
             si_data->virtualsinkid = u->sink_mapping_table[i].virtualsinkidentifier;
             break;
         }
     }
     if (si_data->virtualsinkid == -1)
+    {
+        /* not a stream type we route: nothing to track */
+        pa_xfree(si_data);
         return PA_HOOK_OK;
-    pa_assert(si_data->virtualsinkid != -1);
+    }
     pa_assert(si_data->virtualsinkid >= eVirtualSink_First);
     pa_assert(si_data->virtualsinkid <= eVirtualSink_Last);
 
@@ -3471,37 +3585,20 @@ static pa_hook_result_t route_sink_input_put_hook_callback(pa_core *c, pa_sink_i
     /* notify audiod of stream open */
     if (u->connectionactive && u->connev)
     {
-        // char audiobuf[SIZE_MESG_TO_AUDIOD];
         int ret;
         /* we have a connection send a message to audioD */
         si_data->paused = false;
-        // added for message Type
-        struct paudiodMsgHdr paudioReplyMsgHdr;
-        paudioReplyMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_POLICY;
-        paudioReplyMsgHdr.msgTmp = 0x01;
-        paudioReplyMsgHdr.msgVer = 1;
-        paudioReplyMsgHdr.msgLen = sizeof(struct paudiodMsgHdr);
-        paudioReplyMsgHdr.msgID = 0;
 
         struct paReplyToPolicySet policySet;
+        memset(&policySet, 0, sizeof(policySet));
         policySet.Type = PAUDIOD_REPLY_MSGTYPE_SINK_OPEN;
         policySet.id = si_data->virtualsinkid;
         policySet.index = si_data->sinkinputidx;
-        strncpy(policySet.appName, si_data->appname, APP_NAME_LENGTH);
-        policySet.appName[APP_NAME_LENGTH - 1] = '\0';
+        copy_field(policySet.appName, sizeof(policySet.appName), si_data->appname);
 
-        char *audiobuf = (char *)malloc(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToPolicySet));
-
-        // copying....
-        memcpy(audiobuf, &paudioReplyMsgHdr, sizeof(struct paudiodMsgHdr));
-        memcpy(audiobuf + sizeof(struct paudiodMsgHdr), &policySet, sizeof(struct paReplyToPolicySet));
-
-        /*
-            change msg signal back to 's' when platform audiod is merged*/
-        // sprintf(audiobuf, "o %d %d %s", si_data->virtualsinkid, si_data->sinkinputidx, si_data->appname);
         u->audiod_sink_input_opened[si_data->virtualsinkid]++;
 
-        ret = send(u->newsockfd, audiobuf, SIZE_MESG_TO_AUDIOD, 0);
+        ret = send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_POLICY, 0, &policySet, sizeof(policySet)) ? 0 : -1;
         if (-1 == ret)
             pa_log("send() failed: %s", strerror(errno));
         else
@@ -3510,7 +3607,7 @@ static pa_hook_result_t route_sink_input_put_hook_callback(pa_core *c, pa_sink_i
 
     if (u->preprocess_module && si_data->virtualsinkid == u->PreprocessSinkId)
     {
-        char *media_name = pa_proplist_gets(data->proplist, "media.name");
+        const char *media_name = pa_proplist_gets(data->proplist, "media.name");
         if ((media_name) && (strcmp(media_name, "preprocess Stream") == 0))
         {
         }
@@ -3541,9 +3638,8 @@ static pa_hook_result_t route_source_output_new_hook_callback(pa_core *c, pa_sou
 {
     int i, source_index = erecord;
     pa_proplist *stream_type;
-    pa_proplist *a;
     pa_source *source;
-    char *port, *dest_ip, *prop_name;
+    const char *port, *dest_ip, *prop_name;
     pa_assert(data);
     pa_assert(u);
     pa_assert(c);
@@ -3551,9 +3647,9 @@ static pa_hook_result_t route_source_output_new_hook_callback(pa_core *c, pa_sou
     prop_name = pa_strnull(pa_proplist_gets(data->proplist, PA_PROP_MEDIA_NAME));
     stream_type = pa_proplist_new();
 
-    char *media_name = pa_proplist_gets(data->proplist, "media.name");
-    char *app_name = pa_proplist_gets(data->proplist, PA_PROP_APPLICATION_NAME);
-    char *pref_device = pa_proplist_gets(data->proplist, PA_PROP_PREFERRED_DEVICE);
+    const char *media_name = pa_proplist_gets(data->proplist, "media.name");
+    const char *app_name = pa_proplist_gets(data->proplist, PA_PROP_APPLICATION_NAME);
+    const char *pref_device = pa_proplist_gets(data->proplist, PA_PROP_PREFERRED_DEVICE);
 
     if (!strcmp(prop_name, "RTP Monitor Stream"))
     {
@@ -3602,7 +3698,7 @@ static pa_hook_result_t route_source_output_new_hook_callback(pa_core *c, pa_sou
     else if (pref_device)
     {
         pa_log("preferred device is used to create this stream");
-        char *actualDeviceName = get_device_name_from_detail(pref_device, u, false);
+        const char *actualDeviceName = get_device_name_from_detail(pref_device, u, false);
         if (data->source)
             pa_proplist_sets(stream_type, "media.type", data->source->name);
         else
@@ -3731,7 +3827,11 @@ static pa_hook_result_t route_source_output_put_hook_callback(pa_core *c, pa_sou
         return PA_HOOK_OK; /* nothing to be done for monitor source */
 
     so_type = pa_proplist_gets(so->proplist, "media.type");
-    pa_assert(so_type != NULL);
+    if (so_type == NULL)
+    {
+        pa_log_warn("source output %u has no media.type, leaving it alone", so->index);
+        return PA_HOOK_OK;
+    }
 
     node = pa_xnew0(struct sourceoutputnode, 1);
     node->virtualsourceid = -1;
@@ -3740,11 +3840,11 @@ static pa_hook_result_t route_source_output_put_hook_callback(pa_core *c, pa_sou
     if (pa_proplist_gets(so->proplist, PA_PROP_APPLICATION_NAME) == NULL)
     {
         pa_log("Source opened, application.name not a VALID key..hence adding empty name");
-        strncpy(node->appname, "", APP_NAME_LENGTH);
+        copy_field(node->appname, sizeof(node->appname), "");
     }
     else
     {
-        strncpy(node->appname, pa_proplist_gets(so->proplist, PA_PROP_APPLICATION_NAME), APP_NAME_LENGTH);
+        copy_field(node->appname, sizeof(node->appname), pa_proplist_gets(so->proplist, PA_PROP_APPLICATION_NAME));
     }
     pa_log("Source opened with application name:%s, source output index:%d",
            node->appname, node->sourceoutputidx);
@@ -3753,11 +3853,11 @@ static pa_hook_result_t route_source_output_put_hook_callback(pa_core *c, pa_sou
 
     if (pa_proplist_gets(so->proplist, PA_PROP_PREFERRED_DEVICE))
     {
-        node->bypassRouting = TRUE;
+        node->bypassRouting = true;
     }
     else
     {
-        node->bypassRouting = FALSE;
+        node->bypassRouting = false;
     }
 
     for (i = 0; i < eVirtualSource_Count; i++)
@@ -3769,7 +3869,13 @@ static pa_hook_result_t route_source_output_put_hook_callback(pa_core *c, pa_sou
         }
     }
 
-    pa_assert(source_index != -1);
+    if (source_index == -1)
+    {
+        /* not a stream type we route; do not take the daemon down over it */
+        pa_log_warn("source output %u has unknown media.type %s, leaving it alone", so->index, so_type);
+        pa_xfree(node);
+        return PA_HOOK_OK;
+    }
     node->virtualsourceid = source_index;
 
     u->n_source_output_opened++;
@@ -3784,30 +3890,16 @@ static pa_hook_result_t route_source_output_put_hook_callback(pa_core *c, pa_sou
     }
     if (u->connectionactive && u->connev)
     {
-        // char audiobuf[SIZE_MESG_TO_AUDIOD];
         int ret;
-        // added for message Type
-        struct paudiodMsgHdr paudioReplyMsgHdr;
-        paudioReplyMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_POLICY;
-        paudioReplyMsgHdr.msgTmp = 0x01;
-        paudioReplyMsgHdr.msgVer = 1;
-        paudioReplyMsgHdr.msgLen = sizeof(struct paudiodMsgHdr);
-        paudioReplyMsgHdr.msgID = 0;
 
         struct paReplyToPolicySet policySet;
+        memset(&policySet, 0, sizeof(policySet));
         policySet.Type = PAUDIOD_REPLY_MSGTYPE_SOURCE_OPEN;
         policySet.id = node->virtualsourceid;
         policySet.index = node->sourceoutputidx;
-        strncpy(policySet.appName, node->appname, APP_NAME_LENGTH);
-        policySet.appName[APP_NAME_LENGTH - 1] = '\0';
+        copy_field(policySet.appName, sizeof(policySet.appName), node->appname);
 
-        char *audiobuf = (char *)malloc(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToPolicySet));
-        // copying....
-        memcpy(audiobuf, &paudioReplyMsgHdr, sizeof(struct paudiodMsgHdr));
-        memcpy(audiobuf + sizeof(struct paudiodMsgHdr), &policySet, sizeof(struct paReplyToPolicySet));
-
-        // sprintf(audiobuf, "d %d %d %s", node->virtualsourceid, node->sourceoutputidx, node->appname);
-        ret = send(u->newsockfd, audiobuf, SIZE_MESG_TO_AUDIOD, 0);
+        ret = send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_POLICY, 0, &policySet, sizeof(policySet)) ? 0 : -1;
         if (ret == -1)
             pa_log("Record stream type(%s): send failed(%s)", so_type, strerror(errno));
     }
@@ -3815,7 +3907,7 @@ static pa_hook_result_t route_source_output_put_hook_callback(pa_core *c, pa_sou
 
     if(u->preprocess_module && node->virtualsourceid == u->PreprocessSourceId)
     {
-        char *media_name = pa_proplist_gets(so->proplist, "media.name");
+        const char *media_name = pa_proplist_gets(so->proplist, "media.name");
         if ((media_name) && (strcmp(media_name, "preprocess Stream") == 0))
         {
         }
@@ -3842,7 +3934,7 @@ static pa_hook_result_t route_source_output_put_hook_callback(pa_core *c, pa_sou
 /* callback for stream deletion */
 static pa_hook_result_t route_sink_input_unlink_hook_callback(pa_core *c, pa_sink_input *data, struct userdata *u)
 {
-    char audiodbuf[SIZE_MESG_TO_AUDIOD];
+    (void)c;
     struct sinkinputnode *thelistitem = NULL;
 
     pa_assert(data);
@@ -3855,11 +3947,9 @@ static pa_hook_result_t route_sink_input_unlink_hook_callback(pa_core *c, pa_sin
         if (thelistitem->sinkinput == data)
         {
 
-            bool sinkidReversed = false;
             if (u->preprocess_module && thelistitem->virtualsinkid == -1 * u->PreprocessSinkId)
             {
                 thelistitem->virtualsinkid = u->PreprocessSinkId;
-                sinkidReversed = true;
             }
             /* we have a connection send a message to audioD */
             if (!thelistitem->paused)
@@ -3871,29 +3961,16 @@ static pa_hook_result_t route_sink_input_unlink_hook_callback(pa_core *c, pa_sin
 
                     pa_log("Sink closed with application name:%s, sink input index:%d",
                            thelistitem->appname, thelistitem->sinkinputidx);
-                    // added for message Type
-                    struct paudiodMsgHdr paudioReplyMsgHdr;
-                    paudioReplyMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_POLICY;
-                    paudioReplyMsgHdr.msgTmp = 0x01;
-                    paudioReplyMsgHdr.msgVer = 1;
-                    paudioReplyMsgHdr.msgLen = sizeof(struct paudiodMsgHdr);
-                    paudioReplyMsgHdr.msgID = 0;
 
                     struct paReplyToPolicySet policySet;
+                    memset(&policySet, 0, sizeof(policySet));
                     policySet.Type = PAUDIOD_REPLY_MSGTYPE_SINK_CLOSE;
 
                     policySet.id = thelistitem->virtualsinkid;
                     policySet.index = thelistitem->sinkinputidx;
-                    strncpy(policySet.appName, thelistitem->appname, APP_NAME_LENGTH);
-                    policySet.appName[APP_NAME_LENGTH - 1] = '\0';
+                    copy_field(policySet.appName, sizeof(policySet.appName), thelistitem->appname);
 
-                    char *audiobuf = (char *)malloc(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToPolicySet));
-
-                    // copying....
-                    memcpy(audiobuf, &paudioReplyMsgHdr, sizeof(struct paudiodMsgHdr));
-                    memcpy(audiobuf + sizeof(struct paudiodMsgHdr), &policySet, sizeof(struct paReplyToPolicySet));
-
-                    if (-1 == send(u->newsockfd, audiobuf, SIZE_MESG_TO_AUDIOD, 0))
+                    if (!send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_POLICY, 0, &policySet, sizeof(policySet)))
                         pa_log_info("route_sink_input_unlink_hook_callback: send failed: %s", strerror(errno));
                     else
                         pa_log_info("route_sink_input_unlink_hook_callback: sending close notification to audiod");
@@ -3921,8 +3998,8 @@ static pa_hook_result_t route_sink_input_unlink_hook_callback(pa_core *c, pa_sin
 static pa_hook_result_t
 route_sink_input_state_changed_hook_callback(pa_core *c, pa_sink_input *data, struct userdata *u)
 {
+    (void)c;
     pa_sink_input_state_t state;
-    char *audiodbuf = (char *)malloc(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToPolicySet));
     struct sinkinputnode *thelistitem = NULL;
 
     pa_assert(data);
@@ -3935,6 +4012,8 @@ route_sink_input_state_changed_hook_callback(pa_core *c, pa_sink_input *data, st
         if (thelistitem->sinkinput == data)
         {
             bool sinkidReversed = false;
+            struct paReplyToPolicySet policySet;
+            memset(&policySet, 0, sizeof(policySet));
 
             if (u->preprocess_module && thelistitem->virtualsinkid == -1 * u->PreprocessSinkId)
             {
@@ -3948,26 +4027,12 @@ route_sink_input_state_changed_hook_callback(pa_core *c, pa_sink_input *data, st
             if (!thelistitem->paused && state == PA_SINK_INPUT_CORKED)
             {
                 thelistitem->paused = true;
-                // added for message Type
-                struct paudiodMsgHdr paudioReplyMsgHdr;
-                paudioReplyMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_POLICY;
-                paudioReplyMsgHdr.msgTmp = 0x01;
-                paudioReplyMsgHdr.msgVer = 1;
-                paudioReplyMsgHdr.msgLen = sizeof(struct paudiodMsgHdr);
-                paudioReplyMsgHdr.msgID = 0;
-
-                struct paReplyToPolicySet policySet;
                 policySet.Type = PAUDIOD_REPLY_MSGTYPE_SINK_CLOSE;
 
                 policySet.id = thelistitem->virtualsinkid;
                 policySet.index = thelistitem->sinkinputidx;
-                strncpy(policySet.appName, thelistitem->appname, APP_NAME_LENGTH);
-                policySet.appName[APP_NAME_LENGTH - 1] = '\0';
+                copy_field(policySet.appName, sizeof(policySet.appName), thelistitem->appname);
 
-                // copying....
-                memcpy(audiodbuf, &paudioReplyMsgHdr, sizeof(struct paudiodMsgHdr));
-                memcpy(audiodbuf + sizeof(struct paudiodMsgHdr), &policySet, sizeof(struct paReplyToPolicySet));
-                // sprintf(audiodbuf, "c %d %d %s", thelistitem->virtualsinkid, thelistitem->sinkinputidx, thelistitem->appname);
 
                 // decrease sink opened count, even if audiod doesn't hear from it
                 if (thelistitem->virtualsinkid >= eVirtualSink_First && thelistitem->virtualsinkid <= eVirtualSink_Last)
@@ -3976,24 +4041,11 @@ route_sink_input_state_changed_hook_callback(pa_core *c, pa_sink_input *data, st
             else if (thelistitem->paused && state != PA_SINK_INPUT_CORKED)
             {
                 thelistitem->paused = false;
-                // added for message Type
-                struct paudiodMsgHdr paudioReplyMsgHdr;
-                paudioReplyMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_POLICY;
-                paudioReplyMsgHdr.msgTmp = 0x01;
-                paudioReplyMsgHdr.msgVer = 1;
-                paudioReplyMsgHdr.msgLen = sizeof(struct paudiodMsgHdr);
-                paudioReplyMsgHdr.msgID = 0;
-
-                struct paReplyToPolicySet policySet;
                 policySet.Type = PAUDIOD_REPLY_MSGTYPE_SINK_OPEN;
                 policySet.id = thelistitem->virtualsinkid;
                 policySet.index = thelistitem->sinkinputidx;
-                strncpy(policySet.appName, thelistitem->appname, APP_NAME_LENGTH);
-                policySet.appName[APP_NAME_LENGTH - 1] = '\0';
+                copy_field(policySet.appName, sizeof(policySet.appName), thelistitem->appname);
 
-                // copying....
-                memcpy(audiodbuf, &paudioReplyMsgHdr, sizeof(struct paudiodMsgHdr));
-                memcpy(audiodbuf + sizeof(struct paudiodMsgHdr), &policySet, sizeof(struct paReplyToPolicySet));
 
                 // increase sink opened count, even if audiod doesn't hear from it
                 if (thelistitem->virtualsinkid >= eVirtualSink_First && thelistitem->virtualsinkid <= eVirtualSink_Last)
@@ -4015,8 +4067,8 @@ route_sink_input_state_changed_hook_callback(pa_core *c, pa_sink_input *data, st
             /* notify audiod of stream closure */
             if (u->connectionactive && u->connev != NULL)
             {
-                if (-1 == send(u->newsockfd, audiodbuf, SIZE_MESG_TO_AUDIOD, 0))
-                    pa_log("route_sink_input_state_changed_hook_callback: send failed: %s", strerror(errno));
+                if (!send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_POLICY, 0, &policySet, sizeof(policySet)))
+                    pa_log("route_sink_input_state_changed_hook_callback: send failed");
                 else
                     pa_log_info("route_sink_input_state_changed_hook_callback: sending state change notification to audiod");
             }
@@ -4031,8 +4083,6 @@ static pa_hook_result_t route_source_output_state_changed_hook_callback(pa_core 
 
     pa_source_output_state_t state;
     struct sourceoutputnode *node;
-    char *audiobuf = (char *)malloc(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToPolicySet));
-    int ret;
 
     pa_assert(c);
     pa_assert(so);
@@ -4045,32 +4095,21 @@ static pa_hook_result_t route_source_output_state_changed_hook_callback(pa_core 
         if (node->sourceoutput == so)
         {
             bool sourceidReversed = false;
+            struct paReplyToPolicySet policySet;
+            memset(&policySet, 0, sizeof(policySet));
             if(u->preprocess_module && node->virtualsourceid == -1 * u->PreprocessSourceId)
             {
                 node->virtualsourceid = u->PreprocessSourceId;
                 sourceidReversed = true;
             }
 
-            if (node->paused && state == PA_SOURCE_OUTPUT_CORKED)
+            if (!node->paused && state == PA_SOURCE_OUTPUT_CORKED)
             {
-                // added for message Type
-                struct paudiodMsgHdr paudioReplyMsgHdr;
-                paudioReplyMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_POLICY;
-                paudioReplyMsgHdr.msgTmp = 0x01;
-                paudioReplyMsgHdr.msgVer = 1;
-                paudioReplyMsgHdr.msgLen = sizeof(struct paudiodMsgHdr);
-                paudioReplyMsgHdr.msgID = 0;
-
-                struct paReplyToPolicySet policySet;
                 policySet.Type = PAUDIOD_REPLY_MSGTYPE_SOURCE_CLOSE;
                 policySet.id = node->virtualsourceid;
                 policySet.index = node->sourceoutputidx;
-                strncpy(policySet.appName, node->appname, APP_NAME_LENGTH);
-                policySet.appName[APP_NAME_LENGTH - 1] = '\0';
+                copy_field(policySet.appName, sizeof(policySet.appName), node->appname);
 
-                // copying....
-                memcpy(audiobuf, &paudioReplyMsgHdr, sizeof(struct paudiodMsgHdr));
-                memcpy(audiobuf + sizeof(struct paudiodMsgHdr), &policySet, sizeof(struct paReplyToPolicySet));
                 node->paused = true;
 
                 /* decrease source opened count, even if audiod doesn't hear from it */
@@ -4081,24 +4120,11 @@ static pa_hook_result_t route_source_output_state_changed_hook_callback(pa_core 
             {
                 // pa_assert(node->paused == true);
                 node->paused = false;
-                // added for message Type
-                struct paudiodMsgHdr paudioReplyMsgHdr;
-                paudioReplyMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_POLICY;
-                paudioReplyMsgHdr.msgTmp = 0x01;
-                paudioReplyMsgHdr.msgVer = 1;
-                paudioReplyMsgHdr.msgLen = sizeof(struct paudiodMsgHdr);
-                paudioReplyMsgHdr.msgID = 0;
-
-                struct paReplyToPolicySet policySet;
                 policySet.Type = PAUDIOD_REPLY_MSGTYPE_SOURCE_OPEN;
                 policySet.id = node->virtualsourceid;
                 policySet.index = node->sourceoutputidx;
-                strncpy(policySet.appName, node->appname, APP_NAME_LENGTH);
-                policySet.appName[APP_NAME_LENGTH - 1] = '\0';
+                copy_field(policySet.appName, sizeof(policySet.appName), node->appname);
 
-                // copying....
-                memcpy(audiobuf, &paudioReplyMsgHdr, sizeof(struct paudiodMsgHdr));
-                memcpy(audiobuf + sizeof(struct paudiodMsgHdr), &policySet, sizeof(struct paReplyToPolicySet));
 
                 /* increase source opened count, even if audiod doesn't hear from it */
                 if (node->virtualsourceid >= eVirtualSource_First && node->virtualsourceid <= eVirtualSource_Last)
@@ -4116,9 +4142,8 @@ static pa_hook_result_t route_source_output_state_changed_hook_callback(pa_core 
             {
                 node->virtualsourceid *= -1;
             }
-            ret = send(u->newsockfd, audiobuf, SIZE_MESG_TO_AUDIOD, 0);
-            if (ret == -1)
-                pa_log("Error sending recording stream msg (%s)", audiobuf);
+            if (!send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_POLICY, 0, &policySet, sizeof(policySet)))
+                pa_log("Error sending recording stream state change to audiod");
             break;
         }
     }
@@ -4141,11 +4166,9 @@ static pa_hook_result_t route_source_output_unlink_hook_callback(pa_core *c, pa_
         if (thelistitem->sourceoutput == data)
         {
 
-            bool sourceidReversed = false;
             if (u->preprocess_module && thelistitem->virtualsourceid == -1 * u->PreprocessSourceId)
             {
                 thelistitem->virtualsourceid = u->PreprocessSourceId;
-                sourceidReversed = true;
             }
 
             if (!thelistitem->paused)
@@ -4154,27 +4177,17 @@ static pa_hook_result_t route_source_output_unlink_hook_callback(pa_core *c, pa_
                 /* notify audiod of stream closure */
                 if (u->connectionactive && u->connev != NULL)
                 {
-                    // added for message Type
-                    struct paudiodMsgHdr paudioReplyMsgHdr;
-                    paudioReplyMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_POLICY;
 
                     struct paReplyToPolicySet policySet;
+                    memset(&policySet, 0, sizeof(policySet));
                     policySet.Type = PAUDIOD_REPLY_MSGTYPE_SOURCE_CLOSE;
 
                     policySet.id = thelistitem->virtualsourceid;
                     policySet.index = thelistitem->sourceoutputidx;
-                    strncpy(policySet.appName, thelistitem->appname, APP_NAME_LENGTH);
-                    policySet.appName[APP_NAME_LENGTH - 1] = '\0';
+                    copy_field(policySet.appName, sizeof(policySet.appName), thelistitem->appname);
 
-                    char *audiodbuf = (char *)malloc(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToPolicySet));
 
-                    // copying....
-                    memcpy(audiodbuf, &paudioReplyMsgHdr, sizeof(struct paudiodMsgHdr));
-                    memcpy(audiodbuf + sizeof(struct paudiodMsgHdr), &policySet, sizeof(struct paReplyToPolicySet));
-
-                    // sprintf(audiodbuf, "k %d %d %s", thelistitem->virtualsourceid, thelistitem->sourceoutputidx, thelistitem->appname);
-
-                    if (-1 == send(u->newsockfd, audiodbuf, SIZE_MESG_TO_AUDIOD, 0))
+                    if (!send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_POLICY, 0, &policySet, sizeof(policySet)))
                         pa_log("route_source_output_unlink_hook_callback: send failed: %s", strerror(errno));
                     else
                         pa_log_info("route_source_output_unlink_hook_callback: sending close notification to audiod");
@@ -4202,32 +4215,53 @@ static pa_hook_result_t route_source_output_unlink_hook_callback(pa_core *c, pa_
 
 /* exit and cleanup */
 
+/* Free the module's state as userdata_new() made it, with everything it owns.
+ * Hooks, socket and shared objects are pa__done()'s to release first. */
+static void userdata_free(struct userdata *u)
+{
+    struct sinkinputnode *thelistitem = NULL;
+
+    /* free the list of sink-inputs */
+    while ((thelistitem = u->sinkinputnodelist) != NULL)
+    {
+        PA_LLIST_REMOVE(struct sinkinputnode, u->sinkinputnodelist, thelistitem);
+        pa_xfree(thelistitem);
+    }
+
+    /* and of source-outputs */
+    struct sourceoutputnode *node;
+    while ((node = u->sourceoutputnodelist) != NULL)
+    {
+        PA_LLIST_REMOVE(struct sourceoutputnode, u->sourceoutputnodelist, node);
+        pa_xfree(node);
+    }
+
+    // free memory
+    multiple_device_info_free(&u->usbOutputDeviceInfo);
+
+    multiple_device_info_free(&u->usbInputDeviceInfo);
+
+    multiple_device_info_free(&u->internalInputDeviceInfo);
+
+    multiple_device_info_free(&u->internalOutputDeviceInfo);
+
+    pa_xfree(u->destAddress);
+    pa_xfree(u->connectionType);
+    pa_xfree(u->deviceName);
+    pa_xfree(u);
+}
+
 void pa__done(pa_module *m)
 {
     struct userdata *u;
-    struct sinkinputnode *thelistitem = NULL;
 
     pa_assert(m);
 
     if (!(u = m->userdata))
         return;
 
-    if (u->connev != NULL)
-    {
-        /* a connection exists on the socket, tear down */
-        /* remove ourselves from the IO list on the main loop */
-        u->core->mainloop->io_free(u->connev);
-
-        /* tear down the connection */
-        if (-1 == shutdown(u->newsockfd, SHUT_RDWR))
-        {
-            pa_log_info("Error in shutdown (%d):%s", errno, strerror(errno));
-        }
-        if (-1 == close(u->newsockfd))
-        {
-            pa_log_info("Error in close (%d):%s", errno, strerror(errno));
-        }
-    }
+    /* a connection exists on the socket, tear down */
+    close_connection(u);
 
     if (u->sockev != NULL)
     {
@@ -4249,84 +4283,11 @@ void pa__done(pa_module *m)
 
     disconnect_hooks(u);
 
-    /* free the list of sink-inputs */
-    while ((thelistitem = u->sinkinputnodelist) != NULL)
-    {
-        PA_LLIST_REMOVE(struct sinkinputnode, u->sinkinputnodelist, thelistitem);
-        pa_xfree(thelistitem);
-    }
-
-    // free memory
-    if (u->usbOutputDeviceInfo)
-    {
-        if (u->usbOutputDeviceInfo->deviceList)
-        {
-            pa_xfree(u->usbOutputDeviceInfo->deviceList);
-            u->usbOutputDeviceInfo->deviceList = NULL;
-        }
-        if (u->usbOutputDeviceInfo->baseName)
-        {
-            pa_xfree(u->usbOutputDeviceInfo->baseName);
-            u->usbOutputDeviceInfo->baseName = NULL;
-        }
-        pa_xfree(u->usbOutputDeviceInfo);
-        u->usbOutputDeviceInfo = NULL;
-    }
-
-    if (u->usbInputDeviceInfo)
-    {
-        if (u->usbInputDeviceInfo->deviceList)
-        {
-            pa_xfree(u->usbInputDeviceInfo->deviceList);
-            u->usbInputDeviceInfo->deviceList = NULL;
-        }
-        if (u->usbInputDeviceInfo->baseName)
-        {
-            pa_xfree(u->usbInputDeviceInfo->baseName);
-            u->usbInputDeviceInfo->baseName = NULL;
-        }
-        pa_xfree(u->usbInputDeviceInfo);
-        u->usbInputDeviceInfo = NULL;
-    }
-
-    if (u->internalInputDeviceInfo)
-    {
-        if (u->internalInputDeviceInfo->deviceList)
-        {
-            pa_xfree(u->internalInputDeviceInfo->deviceList);
-            u->internalInputDeviceInfo->deviceList = NULL;
-        }
-        if (u->internalInputDeviceInfo->baseName)
-        {
-            pa_xfree(u->internalInputDeviceInfo->baseName);
-            u->internalInputDeviceInfo->baseName = NULL;
-        }
-        pa_xfree(u->internalInputDeviceInfo);
-        u->internalInputDeviceInfo = NULL;
-    }
-
-    if (u->internalOutputDeviceInfo)
-    {
-        if (u->internalOutputDeviceInfo->deviceList)
-        {
-            pa_xfree(u->internalOutputDeviceInfo->deviceList);
-            u->internalOutputDeviceInfo->deviceList = NULL;
-        }
-        if (u->internalOutputDeviceInfo->baseName)
-        {
-            pa_xfree(u->internalOutputDeviceInfo->baseName);
-            u->internalOutputDeviceInfo->baseName = NULL;
-        }
-        pa_xfree(u->internalOutputDeviceInfo);
-        u->internalOutputDeviceInfo = NULL;
-    }
-
     if (u->palm_policy)
         pa_palm_policy_unref(u->palm_policy);
 
-    pa_xfree(u->destAddress);
-    pa_xfree(u->connectionType);
-    pa_xfree(u);
+    userdata_free(u);
+    m->userdata = NULL;
 }
 
 static pa_hook_result_t route_sink_input_move_finish_cb(pa_core *c, pa_sink_input *data, struct userdata *u)
@@ -4395,31 +4356,18 @@ pa_hook_result_t route_source_unlink_post_cb(pa_core *c, pa_source *source, stru
         /* notify audiod of device insertion */
         if (u->connectionactive && u->connev)
         {
-            // char audiobuf[SIZE_MESG_TO_AUDIOD];
             int ret = -1;
-            // added for message Type
-            struct paudiodMsgHdr paudioReplyMsgHdr;
-            paudioReplyMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_ROUTING;
-            paudioReplyMsgHdr.msgTmp = 0x01;
-            paudioReplyMsgHdr.msgVer = 1;
-            paudioReplyMsgHdr.msgLen = sizeof(struct paudiodMsgHdr);
-            paudioReplyMsgHdr.msgID = 0;
 
             struct paReplyToRoutingSet routingSet;
+            memset(&routingSet, 0, sizeof(routingSet));
             routingSet.Type = PAUDIOD_REPLY_MSGTYPE_DEVICE_REMOVED;
             routingSet.isOutput = 0;
-            strncpy(routingSet.device, u->callback_deviceName, 50);
+            copy_field(routingSet.device, sizeof(routingSet.device), u->callback_deviceName);
             routingSet.deviceIcon[0] = '\0';
             routingSet.deviceNameDetail[0] = '\0';
 
-            char *audiobuf = (char *)malloc(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToRoutingSet));
-
-            // copying....
-            memcpy(audiobuf, &paudioReplyMsgHdr, sizeof(struct paudiodMsgHdr));
-            memcpy(audiobuf + sizeof(struct paudiodMsgHdr), &routingSet, sizeof(struct paReplyToRoutingSet));
             /* we have a connection send a message to audioD */
-            pa_log_info("payload:%s", audiobuf);
-            ret = send(u->newsockfd, audiobuf, SIZE_MESG_TO_AUDIOD, 0);
+            ret = send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_ROUTING, 0, &routingSet, sizeof(routingSet)) ? 0 : -1;
             if (-1 == ret)
                 pa_log("send() failed: %s", strerror(errno));
             else
@@ -4454,33 +4402,19 @@ pa_hook_result_t route_sink_unlink_cb(pa_core *c, pa_sink *sink, struct userdata
             /* notify audiod of device insertion */
             if (u->connectionactive && u->connev)
             {
-                // char audiobuf[SIZE_MESG_TO_AUDIOD];
                 int ret = -1;
                 /* we have a connection send a message to audioD */
-                // added for message Type
-                struct paudiodMsgHdr paudioReplyMsgHdr;
-                paudioReplyMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_ROUTING;
-                paudioReplyMsgHdr.msgTmp = 0x01;
-                paudioReplyMsgHdr.msgVer = 1;
-                paudioReplyMsgHdr.msgLen = sizeof(struct paudiodMsgHdr);
-                paudioReplyMsgHdr.msgID = 0;
 
                 struct paReplyToRoutingSet routingSet;
+                memset(&routingSet, 0, sizeof(routingSet));
                 routingSet.Type = PAUDIOD_REPLY_MSGTYPE_DEVICE_REMOVED;
                 routingSet.isOutput = 1;
                 routingSet.deviceIcon[0] = '\0';
                 routingSet.deviceNameDetail[0] = '\0';
 
-                strncpy(routingSet.device, u->callback_deviceName, 50);
+                copy_field(routingSet.device, sizeof(routingSet.device), u->callback_deviceName);
 
-                char *audiobuf = (char *)malloc(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToRoutingSet));
-
-                // copying....
-                memcpy(audiobuf, &paudioReplyMsgHdr, sizeof(struct paudiodMsgHdr));
-                memcpy(audiobuf + sizeof(struct paudiodMsgHdr), &routingSet, sizeof(struct paReplyToRoutingSet));
-
-                pa_log_info("payload:%s", audiobuf);
-                ret = send(u->newsockfd, audiobuf, SIZE_MESG_TO_AUDIOD, 0);
+                ret = send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_ROUTING, 0, &routingSet, sizeof(routingSet)) ? 0 : -1;
                 if (-1 == ret)
                     pa_log("send() failed: %s", strerror(errno));
                 else
@@ -4494,43 +4428,25 @@ pa_hook_result_t route_sink_unlink_cb(pa_core *c, pa_sink *sink, struct userdata
     }
     else
     {
-        char *deviceNameDetail;
-        char *deviceIcon;
-        if (pa_streq(sink->module->name, MODULE_ALSA_SINK_NAME))
+        if (sink->module && pa_streq(sink->module->name, MODULE_ALSA_SINK_NAME))
         {
             u->callback_deviceName = sink->name;
-            deviceNameDetail = pa_proplist_gets(sink->proplist, ALSA_CARD_NAME);
-            if (!deviceNameDetail)
-                deviceNameDetail = sink->name;
             /* notify audiod of device removal */
             if (u->connectionactive && u->connev)
             {
-                // char audiobuf[SIZE_MESG_TO_AUDIOD];
                 int ret = -1;
-                // added for message Type
-                struct paudiodMsgHdr paudioReplyMsgHdr;
-                paudioReplyMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_ROUTING;
-                paudioReplyMsgHdr.msgTmp = 0x01;
-                paudioReplyMsgHdr.msgVer = 1;
-                paudioReplyMsgHdr.msgLen = sizeof(struct paudiodMsgHdr);
-                paudioReplyMsgHdr.msgID = 0;
 
                 struct paReplyToRoutingSet routingSet;
+                memset(&routingSet, 0, sizeof(routingSet));
                 routingSet.Type = PAUDIOD_REPLY_MSGTYPE_DEVICE_REMOVED;
                 routingSet.isOutput = 1;
                 routingSet.deviceIcon[0] = '\0';
                 routingSet.deviceNameDetail[0] = '\0';
-                strncpy(routingSet.device, u->callback_deviceName, 50);
+                copy_field(routingSet.device, sizeof(routingSet.device), u->callback_deviceName);
 
-                char *audiobuf = (char *)malloc(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToRoutingSet));
-
-                // copying....
-                memcpy(audiobuf, &paudioReplyMsgHdr, sizeof(struct paudiodMsgHdr));
-                memcpy(audiobuf + sizeof(struct paudiodMsgHdr), &routingSet, sizeof(struct paReplyToRoutingSet));
                 /* we have a connection send a message to audioD */
 
-                pa_log_info("payload:%s", audiobuf);
-                ret = send(u->newsockfd, audiobuf, SIZE_MESG_TO_AUDIOD, 0);
+                ret = send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_ROUTING, 0, &routingSet, sizeof(routingSet)) ? 0 : -1;
                 if (-1 == ret)
                     pa_log("send() failed: %s", strerror(errno));
                 else
@@ -4547,45 +4463,33 @@ static pa_hook_result_t source_load_subscription_callback(pa_core *c, pa_source_
 {
     pa_log_info("source_load_subscription_callback");
     pa_assert(c);
-    pa_assert(data->module);
+    pa_assert(data);
     pa_assert(u);
 
-    if (pa_streq(data->module->name, MODULE_ALSA_SOURCE_NAME))
+    /* a source need not belong to a module; only ALSA sources matter here */
+    if (data->module && pa_streq(data->module->name, MODULE_ALSA_SOURCE_NAME))
     {
-        char *deviceNameDetail;
+        const char *deviceNameDetail;
         u->callback_deviceName = data->name;
         deviceNameDetail = pa_proplist_gets(data->proplist, ALSA_CARD_NAME);
-        char *deviceIcon = pa_proplist_gets(data->proplist, PA_PROP_DEVICE_ICON_NAME);
+        const char *deviceIcon = pa_proplist_gets(data->proplist, PA_PROP_DEVICE_ICON_NAME);
         if (!deviceNameDetail)
             deviceNameDetail = data->name;
         /* notify audiod of device insertion */
         if (u->connectionactive && u->connev)
         {
-            // char audiobuf[SIZE_MESG_TO_AUDIOD];
             int ret = -1;
-            // added for message Type
-            struct paudiodMsgHdr paudioReplyMsgHdr;
-            paudioReplyMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_ROUTING;
-            paudioReplyMsgHdr.msgTmp = 0x01;
-            paudioReplyMsgHdr.msgVer = 1;
-            paudioReplyMsgHdr.msgLen = sizeof(struct paudiodMsgHdr);
-            paudioReplyMsgHdr.msgID = 0;
 
             struct paReplyToRoutingSet routingSet;
+            memset(&routingSet, 0, sizeof(routingSet));
             routingSet.Type = PAUDIOD_REPLY_MSGTYPE_DEVICE_CONNECTION;
-            strncpy(routingSet.device, u->callback_deviceName, 50);
-            strncpy(routingSet.deviceNameDetail, deviceNameDetail, 50);
-            strncpy(routingSet.deviceIcon, deviceIcon, DEVICE_NAME_LENGTH);
+            copy_field(routingSet.device, sizeof(routingSet.device), u->callback_deviceName);
+            copy_field(routingSet.deviceNameDetail, sizeof(routingSet.deviceNameDetail), deviceNameDetail);
+            copy_field(routingSet.deviceIcon, sizeof(routingSet.deviceIcon), deviceIcon);
             routingSet.isOutput = 0; // false
-            routingSet.deviceNameDetail[49] = 0;
 
-            char *audiobuf = (char *)malloc(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToRoutingSet));
-            // copying....
-            memcpy(audiobuf, &paudioReplyMsgHdr, sizeof(struct paudiodMsgHdr));
-            memcpy(audiobuf + sizeof(struct paudiodMsgHdr), &routingSet, sizeof(struct paReplyToRoutingSet));
             /* we have a connection send a message to audioD */
-            pa_log_info("payload:%s", audiobuf);
-            ret = send(u->newsockfd, audiobuf, SIZE_MESG_TO_AUDIOD, 0);
+            ret = send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_ROUTING, 0, &routingSet, sizeof(routingSet)) ? 0 : -1;
             if (-1 == ret)
                 pa_log("send() failed: %s", strerror(errno));
             else
@@ -4611,8 +4515,8 @@ pa_hook_result_t sink_load_subscription_callback(pa_core *c, pa_sink_new_data *d
     pa_assert(u);
     if (strstr(data->name, "bluez_sink."))
     {
-        char *deviceNameDetail;
-        char *deviceIcon;
+        const char *deviceNameDetail;
+        const char *deviceIcon;
 
         deviceNameDetail = pa_proplist_gets(data->card->proplist, "bluez.alias");
         deviceIcon = pa_proplist_gets(data->card->proplist, PA_PROP_DEVICE_ICON_NAME);
@@ -4623,32 +4527,18 @@ pa_hook_result_t sink_load_subscription_callback(pa_core *c, pa_sink_new_data *d
             /* notify audiod of device insertion */
             if (u->connectionactive && u->connev)
             {
-                // char audiobuf[SIZE_MESG_TO_AUDIOD];
                 int ret = -1;
-                // added for message Type
-                struct paudiodMsgHdr paudioReplyMsgHdr;
-                paudioReplyMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_ROUTING;
-                paudioReplyMsgHdr.msgTmp = 0x01;
-                paudioReplyMsgHdr.msgVer = 1;
-                paudioReplyMsgHdr.msgLen = sizeof(struct paudiodMsgHdr);
-                paudioReplyMsgHdr.msgID = 0;
 
                 struct paReplyToRoutingSet routingSet;
+                memset(&routingSet, 0, sizeof(routingSet));
                 routingSet.Type = PAUDIOD_REPLY_MSGTYPE_DEVICE_CONNECTION;
-                strncpy(routingSet.device, u->callback_deviceName, 50);
-                strncpy(routingSet.deviceNameDetail, deviceNameDetail, 50);
-                strncpy(routingSet.deviceIcon, deviceIcon, DEVICE_NAME_LENGTH);
+                copy_field(routingSet.device, sizeof(routingSet.device), u->callback_deviceName);
+                copy_field(routingSet.deviceNameDetail, sizeof(routingSet.deviceNameDetail), deviceNameDetail);
+                copy_field(routingSet.deviceIcon, sizeof(routingSet.deviceIcon), deviceIcon);
                 routingSet.isOutput = 1; // true
-                routingSet.deviceNameDetail[49] = 0;
 
-                char *audiobuf = (char *)malloc(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToRoutingSet));
-                // copying....
-                memcpy(audiobuf, &paudioReplyMsgHdr, sizeof(struct paudiodMsgHdr));
-                memcpy(audiobuf + sizeof(struct paudiodMsgHdr), &routingSet, sizeof(struct paReplyToRoutingSet));
                 /* we have a connection send a message to audioD */
-                // sprintf(audiobuf, "%c %s %s", 'i', u->callback_deviceName, deviceNameDetail);
-                pa_log_info("payload:%s", audiobuf);
-                ret = send(u->newsockfd, audiobuf, SIZE_MESG_TO_AUDIOD, 0);
+                ret = send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_ROUTING, 0, &routingSet, sizeof(routingSet)) ? 0 : -1;
                 if (-1 == ret)
                     pa_log("send() failed: %s", strerror(errno));
                 else
@@ -4662,8 +4552,8 @@ pa_hook_result_t sink_load_subscription_callback(pa_core *c, pa_sink_new_data *d
     }
     else
     {
-        char *deviceNameDetail;
-        char *deviceIcon;
+        const char *deviceNameDetail;
+        const char *deviceIcon;
         if (pa_streq(data->module->name, MODULE_ALSA_SINK_NAME))
         {
             u->callback_deviceName = data->name;
@@ -4676,31 +4566,18 @@ pa_hook_result_t sink_load_subscription_callback(pa_core *c, pa_sink_new_data *d
             /* notify audiod of device insertion */
             if (u->connectionactive && u->connev)
             {
-                // char audiobuf[SIZE_MESG_TO_AUDIOD];
                 int ret = -1;
-                // added for message Type
-                struct paudiodMsgHdr paudioReplyMsgHdr;
-                paudioReplyMsgHdr.msgType = PAUDIOD_REPLY_MSGTYPE_ROUTING;
-                paudioReplyMsgHdr.msgTmp = 0x01;
-                paudioReplyMsgHdr.msgVer = 1;
-                paudioReplyMsgHdr.msgLen = sizeof(struct paudiodMsgHdr);
-                paudioReplyMsgHdr.msgID = 0;
 
                 struct paReplyToRoutingSet routingSet;
+                memset(&routingSet, 0, sizeof(routingSet));
                 routingSet.Type = PAUDIOD_REPLY_MSGTYPE_DEVICE_CONNECTION;
-                strncpy(routingSet.device, u->callback_deviceName, 50);
-                strncpy(routingSet.deviceNameDetail, deviceNameDetail, 50);
-                strncpy(routingSet.deviceIcon, deviceIcon, DEVICE_NAME_LENGTH);
-                routingSet.deviceNameDetail[49] = 0;
+                copy_field(routingSet.device, sizeof(routingSet.device), u->callback_deviceName);
+                copy_field(routingSet.deviceNameDetail, sizeof(routingSet.deviceNameDetail), deviceNameDetail);
+                copy_field(routingSet.deviceIcon, sizeof(routingSet.deviceIcon), deviceIcon);
                 routingSet.isOutput = 1; // true
 
-                char *audiobuf = (char *)malloc(sizeof(struct paudiodMsgHdr) + sizeof(struct paReplyToRoutingSet));
-                // copying....
-                memcpy(audiobuf, &paudioReplyMsgHdr, sizeof(struct paudiodMsgHdr));
-                memcpy(audiobuf + sizeof(struct paudiodMsgHdr), &routingSet, sizeof(struct paReplyToRoutingSet));
                 /* we have a connection send a message to audioD */
-                pa_log_info("payload:%s", audiobuf);
-                ret = send(u->newsockfd, audiobuf, SIZE_MESG_TO_AUDIOD, 0);
+                ret = send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_ROUTING, 0, &routingSet, sizeof(routingSet)) ? 0 : -1;
                 if (-1 == ret)
                     pa_log("send() failed: %s", strerror(errno));
                 else
@@ -4716,43 +4593,12 @@ pa_hook_result_t sink_load_subscription_callback(pa_core *c, pa_sink_new_data *d
     return PA_HOOK_OK;
 }
 
-static const char *const device_valid_modargs[] = {
-    "name",
-    "source_name",
-    "source_properties",
-    "namereg_fail",
-    "device",
-    "device_id",
-    "format",
-    "rate",
-    "alternate_rate",
-    "channels",
-    "channel_map",
-    "fragments",
-    "fragment_size",
-    "mmap",
-    "tsched",
-    "tsched_buffer_size",
-    "tsched_buffer_watermark",
-    "ignore_dB",
-    "control",
-    "deferred_volume",
-    "deferred_volume_safety_margin",
-    "deferred_volume_extra_delay",
-    "fixed_latency_range",
-    "sink_name",
-    "sink_properties",
-    "rewind_safeguard",
-    NULL};
-
 pa_hook_result_t module_unload_subscription_callback(pa_core *c, pa_module *m, struct userdata *u)
 {
     pa_log_info("module_unload_subscription_callback");
     pa_assert(c);
     pa_assert(m);
     pa_assert(u);
-    pa_modargs *ma = NULL;
-    pa_sink_new_data data;
     pa_log_debug("module_unloaded with index#:%u", m->index);
     if (!strcmp(m->name, MODULE_ALSA_SINK_NAME))
         check_and_remove_usb_device_module(u, true, m);
@@ -4769,7 +4615,6 @@ pa_hook_result_t module_load_subscription_callback(pa_core *c, pa_module *m, str
     pa_assert(m);
     pa_assert(u);
     pa_log_debug("module_loaded with name:%s", m->name);
-    pa_modargs *ma = NULL;
 
     return PA_HOOK_OK;
 }
