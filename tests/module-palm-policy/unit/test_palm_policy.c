@@ -355,6 +355,36 @@ TEST(Routing, anotherSinkOrAPreferredDeviceIsAChoice)
     CHECK(stream_chose_its_sink(&other_sink_stub, NULL, NULL));
 }
 
+/* The sink module-bluez5-device makes for a headset, which the policy looks
+ * up to tell audiod of a headset already there (audiod restarted, or missed
+ * it while bluetooth2 was away). */
+TEST(Bluetooth, sinkNameOfAnAddress)
+{
+    char name[BLUETOOTH_SINK_NAME_SIZE];
+
+    bluetooth_sink_name("74:1a:e0:20:8f:18", name, sizeof(name));
+    CHECK(strcmp(name, "bluez_sink.74_1A_E0_20_8F_18") == 0);
+    bluetooth_sink_name("", name, sizeof(name));
+    CHECK(strcmp(name, "bluez_sink.") == 0);
+    bluetooth_sink_name(NULL, name, sizeof(name));
+    CHECK(strcmp(name, "bluez_sink.") == 0);
+}
+
+TEST(Bluetooth, sinkNameIsBoundedAndTerminated)
+{
+    char small[16];
+
+    memset(small, 'x', sizeof(small));
+    bluetooth_sink_name("74:1a:e0:20:8f:18", small, sizeof(small));
+    CHECK_EQ(strlen(small), sizeof(small) - 1);
+    CHECK(strncmp(small, "bluez_sink.74_1", sizeof(small) - 1) == 0);
+
+    char tiny[4];
+    memset(tiny, 'x', sizeof(tiny));
+    bluetooth_sink_name("74:1a", tiny, sizeof(tiny));
+    CHECK_EQ(tiny[0], '\0');
+}
+
 /* --- life cycle ----------------------------------------------------------- */
 
 TEST(Lifecycle, newAndFree)
