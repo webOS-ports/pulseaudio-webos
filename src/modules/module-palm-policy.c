@@ -1899,39 +1899,96 @@ static void send_rtp_connection_data_to_audiod(const char *ip, const char *port,
         pa_log("Message sent to audiod");
 }
 
+/* The name module-bluez5-device gives the A2DP sink of address:
+ * "bluez_sink." and the address in upper case with '_' for ':'. */
+static void bluetooth_sink_name(const char *address, char *out, size_t size)
+{
+    size_t n = 0;
+    int written = snprintf(out, size, "bluez_sink.");
+    if (written < 0 || (size_t)written >= size)
+    {
+        if (size)
+            out[0] = '\0';
+        return;
+    }
+    n = (size_t)written;
+    for (size_t i = 0; address && address[i] != '\0' && n + 1 < size; i++, n++)
+    {
+        char c = address[i];
+        if (c >= 'a' && c <= 'z')
+            c = (char)(c - 32);
+        else if (c == ':')
+            c = '_';
+        out[n] = c;
+    }
+    out[n] = '\0';
+}
+
+/* Tells audiod a Bluetooth output is there, as the sink being put does. */
+static void announce_bluetooth_sink(struct userdata *u, const char *name, pa_proplist *cardProplist)
+{
+    const char *deviceNameDetail = cardProplist ? pa_proplist_gets(cardProplist, "bluez.alias") : NULL;
+    const char *deviceIcon = cardProplist ? pa_proplist_gets(cardProplist, PA_PROP_DEVICE_ICON_NAME) : NULL;
+    pa_log_debug("BT sink connected with name:%s : %s,%s", name, deviceNameDetail, deviceIcon);
+    if (!(u->connectionactive && u->connev))
+    {
+        pa_log_warn("connectionactive is not active");
+        return;
+    }
+    struct paReplyToRoutingSet routingSet;
+    memset(&routingSet, 0, sizeof(routingSet));
+    routingSet.Type = PAUDIOD_REPLY_MSGTYPE_DEVICE_CONNECTION;
+    copy_field(routingSet.device, sizeof(routingSet.device), name);
+    copy_field(routingSet.deviceNameDetail, sizeof(routingSet.deviceNameDetail), deviceNameDetail);
+    copy_field(routingSet.deviceIcon, sizeof(routingSet.deviceIcon), deviceIcon);
+    routingSet.isOutput = 1; // true
+    if (!send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_ROUTING, 0, &routingSet, sizeof(routingSet)))
+        pa_log("send() failed: %s", strerror(errno));
+    else
+        pa_log_info("sent device loaded message to audiod");
+}
+
+/* The device's sink: the profile follows the address in its name
+ * ("bluez_sink.<ADDRESS>.a2dp_sink"). */
+static pa_sink *find_bluetooth_sink(struct userdata *u, const char *prefix)
+{
+    size_t len = strlen(prefix);
+    pa_sink *sink;
+    uint32_t idx;
+    if (len == 0)
+        return NULL;
+    PA_IDXSET_FOREACH(sink, u->core->sinks, idx)
+    {
+        if (PA_SINK_IS_LINKED(sink->state) && strncmp(sink->name, prefix, len) == 0 &&
+            (sink->name[len] == '\0' || sink->name[len] == '.'))
+            return sink;
+    }
+    return NULL;
+}
+
 static bool load_Bluetooth_module(struct userdata *u)
 {
     u->IsBluetoothEnabled = true;
+    bluetooth_sink_name(u->address, u->physicalSinkBT, sizeof(u->physicalSinkBT));
     if (NULL == u->btDiscoverModule)
     {
+        /* Refused when PulseAudio's own configuration loaded it already. */
         pa_module_load(&u->btDiscoverModule, u->core, "module-bluetooth-discover", NULL);
-        char physicalSinkBT[BLUETOOTH_SINK_NAME_SIZE];
-        char btSinkInit[BLUETOOTH_SINK_INIT_SIZE] = "bluez_sink.";
-        btSinkInit[BLUETOOTH_SINK_INIT_SIZE - 1] = '\0';
-
-        int index = 0;
-        while (u->address[index] != '\0')
-        {
-            if (u->address[index] >= 'a' && u->address[index] <= 'z')
-            {
-                u->address[index] = u->address[index] - 32;
-            }
-            index++;
-        }
-        snprintf(physicalSinkBT, sizeof(physicalSinkBT), "%s%s", btSinkInit, u->address);
-        for (size_t j = 0; j < strlen(physicalSinkBT); j++)
-        {
-            if (physicalSinkBT[j] == ':')
-                physicalSinkBT[j] = '_';
-        }
-        copy_field(u->physicalSinkBT, sizeof(u->physicalSinkBT), physicalSinkBT);
         if (NULL == u->btDiscoverModule)
-            pa_log_info("%s :module-bluetooth-discover loading failed", __FUNCTION__);
+            pa_log_info("%s :module-bluetooth-discover not loaded here", __FUNCTION__);
         else
             pa_log_info("%s :module-bluetooth-discover loaded", __FUNCTION__);
     }
     else
         pa_log_info("%s :module-bluetooth-discover already loaded", __FUNCTION__);
+
+    /* The headset's sink may be there already - audiod restarted, or missed
+     * the headset coming while bluetooth2 was away. Its being put was
+     * announced then or not at all; announce it now, or audiod never routes
+     * to it. A sink still to come is announced when it is put. */
+    pa_sink *sink = find_bluetooth_sink(u, u->physicalSinkBT);
+    if (sink)
+        announce_bluetooth_sink(u, sink->name, sink->card ? sink->card->proplist : NULL);
     return true;
 }
 
@@ -4531,38 +4588,9 @@ pa_hook_result_t sink_load_subscription_callback(pa_core *c, pa_sink_new_data *d
     pa_assert(u);
     if (strstr(data->name, "bluez_sink."))
     {
-        const char *deviceNameDetail;
-        const char *deviceIcon;
-
-        deviceNameDetail = pa_proplist_gets(data->card->proplist, "bluez.alias");
-        deviceIcon = pa_proplist_gets(data->card->proplist, PA_PROP_DEVICE_ICON_NAME);
-        pa_log_debug("BT sink connected with name:%s : %s,%s", data->name, deviceNameDetail, deviceIcon);
         u->callback_deviceName = data->name;
         if (NULL != u->callback_deviceName)
-        {
-            /* notify audiod of device insertion */
-            if (u->connectionactive && u->connev)
-            {
-                int ret = -1;
-
-                struct paReplyToRoutingSet routingSet;
-                memset(&routingSet, 0, sizeof(routingSet));
-                routingSet.Type = PAUDIOD_REPLY_MSGTYPE_DEVICE_CONNECTION;
-                copy_field(routingSet.device, sizeof(routingSet.device), u->callback_deviceName);
-                copy_field(routingSet.deviceNameDetail, sizeof(routingSet.deviceNameDetail), deviceNameDetail);
-                copy_field(routingSet.deviceIcon, sizeof(routingSet.deviceIcon), deviceIcon);
-                routingSet.isOutput = 1; // true
-
-                /* we have a connection send a message to audioD */
-                ret = send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_ROUTING, 0, &routingSet, sizeof(routingSet)) ? 0 : -1;
-                if (-1 == ret)
-                    pa_log("send() failed: %s", strerror(errno));
-                else
-                    pa_log_info("sent device loaded message to audiod");
-            }
-            else
-                pa_log_warn("connectionactive is not active");
-        }
+            announce_bluetooth_sink(u, data->name, data->card ? data->card->proplist : NULL);
         else
             pa_log_warn("error reading device name");
     }
