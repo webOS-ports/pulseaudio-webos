@@ -47,11 +47,31 @@ export PULSE_SERVER=unix:$T/run/native
 PC=("$LD" --library-path "$LP" "$ROOTFS/usr/bin/pacat")
 STREAMS=()
 PULSE_PROP='media.type=pmedia application.name=t1' timeout 3 "${PC[@]}" --playback /dev/zero & STREAMS+=($!)
-PULSE_PROP='application.name=t2' timeout 3 "${PC[@]}" --playback /dev/zero & STREAMS+=($!)
-PULSE_PROP='application.name=t3' timeout 3 "${PC[@]}" --playback -d pcm_output /dev/zero & STREAMS+=($!)
+PULSE_PROP='application.name=t2 test.stream=t2' timeout 3 "${PC[@]}" --playback /dev/zero & STREAMS+=($!)
+PULSE_PROP='application.name=t3 test.stream=t3' timeout 3 "${PC[@]}" --playback -d pcm_output /dev/zero & STREAMS+=($!)
 PULSE_PROP='media.role=phone application.name=t4' timeout 3 "${PC[@]}" --playback /dev/zero & STREAMS+=($!)
 PULSE_PROP='media.type=record application.name=r1' timeout 3 "${PC[@]}" --record > /dev/null & STREAMS+=($!)
 PULSE_PROP='media.type=nonsense application.name=r2' timeout 3 "${PC[@]}" --record -d record > /dev/null & STREAMS+=($!)
+# t3 names the default sink, as QtMultimedia does: it must be routed like t2,
+# which names none - on pdefaultapp, with no preferred device of its own -
+# or it is never moved off the loudspeaker.
+sleep 1
+"$LD" --library-path "$LP" "$ROOTFS/usr/bin/pactl" list sink-inputs > "$T/sink-inputs.txt" 2>&1
+for app in t2 t3; do
+    # pacat puts its own application.name over PULSE_PROP's
+    props=$(awk -v app="test.stream = \"$app\"" '
+        function flush() { if (hit) print block }
+        /^Sink Input #/ { flush(); block = ""; hit = 0 }
+        { block = block "\n" $0; if (index($0, app)) hit = 1 }
+        END { flush() }' "$T/sink-inputs.txt")
+    type=$(echo "$props" | sed -n 's/.*media.type = "\(.*\)"/\1/p' | head -n 1)
+    pref=$(echo "$props" | grep -c "preferred.device")
+    if [ "$type" = pdefaultapp ] && [ "$pref" = 0 ]; then
+        echo "### routing $app: ok (media.type $type)"
+    else
+        echo "### routing $app: FAIL (media.type '$type', preferred.device $pref)"
+    fi
+done
 python3 "$HERE/client.py" 7 "$FUZZ"; echo "### client rc=$?"
 for p in "${STREAMS[@]}"; do wait $p; done
 kill -TERM $PAPID; for i in $(seq 300); do kill -0 $PAPID 2>/dev/null || break; sleep 0.2; done

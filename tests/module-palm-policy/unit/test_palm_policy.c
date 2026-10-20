@@ -335,6 +335,26 @@ TEST(Routing, refusesADeviceThatIsNotThere)
     fixture_down(&f);
 }
 
+/* What QtMultimedia does: it names the default sink for its default output.
+ * That is no choice of sink, and the stream has to be routed - or it stays on
+ * the loudspeaker when a headset connects. Only these addresses are compared. */
+static pa_sink default_sink_stub, other_sink_stub;
+
+TEST(Routing, namingTheDefaultSinkIsNoChoice)
+{
+    CHECK(!stream_chose_its_sink(NULL, &default_sink_stub, NULL));
+    CHECK(!stream_chose_its_sink(&default_sink_stub, &default_sink_stub, NULL));
+}
+
+TEST(Routing, anotherSinkOrAPreferredDeviceIsAChoice)
+{
+    CHECK(stream_chose_its_sink(&other_sink_stub, &default_sink_stub, NULL));
+    CHECK(stream_chose_its_sink(&default_sink_stub, &default_sink_stub, "bluez_sink.x"));
+    CHECK(stream_chose_its_sink(NULL, &default_sink_stub, "pcm_output"));
+    /* no default sink at all: a named sink is all there is to go on */
+    CHECK(stream_chose_its_sink(&other_sink_stub, NULL, NULL));
+}
+
 /* --- life cycle ----------------------------------------------------------- */
 
 TEST(Lifecycle, newAndFree)

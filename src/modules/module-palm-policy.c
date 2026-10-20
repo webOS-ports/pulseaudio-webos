@@ -3310,6 +3310,22 @@ fail:
     return -1;
 }
 
+/* Whether a new stream asked for a sink of its own, rather than for whatever
+ * plays by default. A client that names the default sink is asking for the
+ * default - QtMultimedia always does, for its default output - and so is one
+ * that names nothing. Only another sink, or a preferred device, is a choice:
+ * such a stream keeps its sink and is not routed. Taking the default sink by
+ * name for a choice pinned Qt players (the music app, the compositor's
+ * sounds) to pcm_output, the loudspeaker: they stayed there when a headset
+ * connected, while every routed stream followed it. */
+static bool stream_chose_its_sink(const pa_sink *requested, const pa_sink *default_sink,
+                                  const char *preferred_device)
+{
+    if (preferred_device)
+        return true;
+    return requested != NULL && requested != default_sink;
+}
+
 /* callback for stream creation */
 static pa_hook_result_t route_sink_input_new_hook_callback(pa_core *c, pa_sink_input_new_data *data,
                                                            struct userdata *u)
@@ -3352,7 +3368,7 @@ static pa_hook_result_t route_sink_input_new_hook_callback(pa_core *c, pa_sink_i
             pa_log("No device found for preferred device : ERROR");
         }
     }
-    else if (data->sink == NULL)
+    else if (!stream_chose_its_sink(data->sink, c->default_sink, pref_device))
     {
         /* redirect everything to the default application stream */
         pa_log_info("THE DEFAULT DEVICE WAS USED TO CREATE THIS STREAM - PLEASE CATEGORIZE USING A VIRTUAL STREAM");
