@@ -355,6 +355,171 @@ TEST(Routing, anotherSinkOrAPreferredDeviceIsAChoice)
     CHECK(stream_chose_its_sink(&other_sink_stub, NULL, NULL));
 }
 
+/* --- phone-era sinks ------------------------------------------------------ */
+
+/* palarm, pcalendar and the rest exist as null sinks but have no class of
+ * their own; a stream on one was left there, silent. They are routed as the
+ * class they are an alias of. */
+TEST(SinkClass, aVirtualSinkIsItsOwnClass)
+{
+    for (int i = eVirtualSink_First; i < eVirtualSink_Count; i++)
+        CHECK_EQ(virtual_sink_class(virtualsinkmap[i].virtualsinkname), i);
+}
+
+TEST(SinkClass, aPhoneEraSinkIsRoutedAsItsAlias)
+{
+    CHECK_EQ(virtual_sink_class("palarm"), eringtones);
+    CHECK_EQ(virtual_sink_class("pcalendar"), ealerts);
+    CHECK_EQ(virtual_sink_class("pnotifications"), ealerts);
+    CHECK_EQ(virtual_sink_class("pDTMF"), efeedback);
+    CHECK_EQ(virtual_sink_class("pvoip"), evoipcall);
+    CHECK_EQ(virtual_sink_class("pvvm"), emedia);
+    CHECK_EQ(virtual_sink_class("pnavigation"), etts);
+    CHECK_EQ(virtual_sink_class("pvoicedial"), evoicerecognition);
+    CHECK_EQ(virtual_sink_class("pflash"), edefaultapp);
+}
+
+TEST(SinkClass, everyAliasIsARoutedClassAndNotAVirtualSink)
+{
+    for (int a = 0; virtualsinkaliases[a].virtualsinkname; a++) {
+        int routed = (int)virtualsinkaliases[a].routedas;
+
+        CHECK(routed >= eVirtualSink_First && routed < eVirtualSink_Count);
+        for (int i = eVirtualSink_First; i < eVirtualSink_Count; i++)
+            CHECK(strcmp(virtualsinkaliases[a].virtualsinkname, virtualsinkmap[i].virtualsinkname) != 0);
+    }
+}
+
+TEST(SinkClass, anythingElseIsNotRouted)
+{
+    CHECK_EQ(virtual_sink_class(NULL), -1);
+    CHECK_EQ(virtual_sink_class(""), -1);
+    CHECK_EQ(virtual_sink_class("pcm_output"), -1);
+    CHECK_EQ(virtual_sink_class("palarm.monitor"), -1);
+    CHECK_EQ(virtual_sink_class("palar"), -1);
+    CHECK_EQ(virtual_sink_class("PALARM"), -1);
+}
+
+/* The new-stream hook: a stream opened on the palarm null sink is routed as a
+ * ringtone and tagged with its own name. No sink is registered in the test
+ * core, so where it would be moved to cannot be looked up and it stays put;
+ * the class it was given is what the routing goes by. */
+TEST(SinkClass, aStreamOpenedOnAPhoneEraSinkIsRoutedAsItsClass)
+{
+    struct fixture f;
+    pa_sink_input_new_data d;
+    pa_sink palarm;
+
+    fixture_up(&f);
+    memset(&palarm, 0, sizeof(palarm));
+    palarm.name = (char *)"palarm";
+    palarm.driver = (char *)MODULE_NULL_SINK;
+    f.u->media_type = edefaultapp;
+
+    pa_sink_input_new_data_init(&d);
+    d.sink = &palarm;
+    route_sink_input_new_hook_callback(f.core, &d, f.u);
+    CHECK_EQ(f.u->media_type, eringtones);
+    CHECK(pa_safe_streq(pa_proplist_gets(d.proplist, "media.type"), "palarm"));
+    CHECK(d.sink == &palarm);
+    pa_sink_input_new_data_done(&d);
+
+    /* a null sink that is no class at all is still left alone */
+    f.u->media_type = edefaultapp;
+    palarm.name = (char *)"pcm_output_null";
+    pa_sink_input_new_data_init(&d);
+    d.sink = &palarm;
+    route_sink_input_new_hook_callback(f.core, &d, f.u);
+    CHECK_EQ(f.u->media_type, edefaultapp);
+    pa_sink_input_new_data_done(&d);
+
+    fixture_down(&f);
+}
+
+/* A stream opened on palarm, as the new-stream hook leaves it: tagged with its
+ * own name. */
+static void alarm_stream_data(pa_sink_input_new_data *d, const char *media_type)
+{
+    pa_sink_input_new_data_init(d);
+    pa_proplist_sets(d->proplist, "media.type", media_type);
+    pa_proplist_sets(d->proplist, PA_PROP_APPLICATION_NAME, "clock");
+    pa_channel_map_init_stereo(&d->channel_map);
+    d->volume_writable = true;
+}
+
+TEST(SinkClass, aPhoneEraStreamTakesItsClassVolumeAndMute)
+{
+    struct fixture f;
+    pa_sink_input_new_data d;
+
+    fixture_up(&f);
+    f.u->sink_mapping_table[eringtones].volume = 80;
+    f.u->sink_mapping_table[eringtones].ismuted = true;
+    f.u->sink_mapping_table[ealerts].volume = 20;
+    f.u->sink_mapping_table[ealerts].ismuted = false;
+
+    alarm_stream_data(&d, "palarm");
+    route_sink_input_fixate_hook_callback(f.core, &d, f.u);
+    CHECK(d.muted_is_set);
+    CHECK(d.muted);
+    CHECK(d.volume_is_set);
+    CHECK_EQ(d.volume.values[0],
+             pa_sw_volume_from_dB(_mapPercentToPulseRamp[f.u->sink_mapping_table[eringtones].volumetable][80]));
+    /* the tag stays the stream's own name, which audiod's ring state wants */
+    CHECK(pa_safe_streq(pa_proplist_gets(d.proplist, "media.type"), "palarm"));
+    pa_sink_input_new_data_done(&d);
+
+    alarm_stream_data(&d, "pcalendar");
+    route_sink_input_fixate_hook_callback(f.core, &d, f.u);
+    CHECK(d.muted_is_set);
+    CHECK(!d.muted);
+    CHECK_EQ(d.volume.values[0],
+             pa_sw_volume_from_dB(_mapPercentToPulseRamp[f.u->sink_mapping_table[ealerts].volumetable][20]));
+    pa_sink_input_new_data_done(&d);
+
+    /* not a class: volume and mute are left alone */
+    alarm_stream_data(&d, "pcm_output");
+    route_sink_input_fixate_hook_callback(f.core, &d, f.u);
+    CHECK(!d.muted_is_set);
+    CHECK(!d.volume_is_set);
+    pa_sink_input_new_data_done(&d);
+
+    fixture_down(&f);
+}
+
+/* The put hook is what puts a stream in the list the routing moves, and what
+ * audiod is told about: a palarm stream has to be in it as a ringtone. */
+TEST(SinkClass, aPhoneEraStreamIsTrackedAsItsClass)
+{
+    struct fixture f;
+    pa_sink_input si;
+
+    fixture_up(&f);
+    memset(&si, 0, sizeof(si));
+    si.proplist = pa_proplist_new();
+    si.index = 42;
+    si.state = PA_SINK_INPUT_RUNNING;
+
+    pa_proplist_sets(si.proplist, "media.type", "palarm");
+    route_sink_input_put_hook_callback(f.core, &si, f.u);
+    CHECK(f.u->sinkinputnodelist != NULL);
+    if (f.u->sinkinputnodelist) {
+        CHECK_EQ(f.u->sinkinputnodelist->virtualsinkid, eringtones);
+        CHECK_EQ(f.u->sinkinputnodelist->sinkinputidx, 42);
+    }
+    CHECK_EQ(f.u->n_sink_input_opened, 1);
+
+    /* a stream the policy does not route is not tracked */
+    si.index = 43;
+    pa_proplist_sets(si.proplist, "media.type", "pcm_output");
+    route_sink_input_put_hook_callback(f.core, &si, f.u);
+    CHECK_EQ(f.u->n_sink_input_opened, 1);
+    CHECK(f.u->sinkinputnodelist == NULL || f.u->sinkinputnodelist->sinkinputidx == 42);
+
+    pa_proplist_free(si.proplist);
+    fixture_down(&f);
+}
+
 /* The sink module-bluez5-device makes for a headset, which the policy looks
  * up to tell audiod of a headset already there (audiod restarted, or missed
  * it while bluetooth2 was away). */

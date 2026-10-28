@@ -81,6 +81,39 @@ static struct _virtualsinkmap virtualsinkmap[] = {
     {NULL, 0, "", 0, 0, 0}
 };
 
+/* The phone-era virtual sinks LuneOS still creates (webos-virtual-devices.pa)
+ * but this generation's EVirtualSink has no entry for. A stream opened on one
+ * is routed, given its volume and reported to audiod as the class it is an
+ * alias of here; its media.type stays the name it was opened on, which is what
+ * audiod's ring state keys on ("palarm" rings on both outputs). Without this
+ * such a stream stayed on its null sink: silent, and never seen by audiod.
+ */
+struct _virtualsinkalias {
+    const char *virtualsinkname;
+    enum EVirtualSink routedas;
+};
+
+static const struct _virtualsinkalias virtualsinkaliases[] = {
+    /* an alarm has to be heard the way the phone ringing is */
+    {"palarm",          eringtones},
+    /* reminders and notification sounds are alerts */
+    {"pcalendar",       ealerts},
+    {"pnotifications",  ealerts},
+    /* keypad tones are feedback; audiod plays its own DTMF there too */
+    {"pDTMF",           efeedback},
+    /* the downlink of a call */
+    {"pvoip",           evoipcall},
+    /* voicemail playback is a recording; audiod's /vvm shares pmedia too */
+    {"pvvm",            emedia},
+    /* spoken directions are speech, like text-to-speech */
+    {"pnavigation",     etts},
+    /* the voice dialer's prompts belong with voice recognition */
+    {"pvoicedial",      evoicerecognition},
+    /* what the Flash plug-in played: an application's sound */
+    {"pflash",          edefaultapp},
+    {NULL,              eVirtualSink_None}
+};
+
 static struct _virtualsourcemap virtualsourcemap[] = {
     {"record",           (uint32_t)erecord, "record", 0, 0, false},
     {"btcallsource",     (uint32_t)ebtcallsource, "btcallsource", 0, 0, false},

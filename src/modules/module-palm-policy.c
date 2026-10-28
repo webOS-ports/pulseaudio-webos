@@ -3383,6 +3383,26 @@ static bool stream_chose_its_sink(const pa_sink *requested, const pa_sink *defau
     return requested != NULL && requested != default_sink;
 }
 
+/* The routed class of a stream opened on, or tagged with, the sink called
+ * @name: the virtual sink of that name, else the one a phone-era sink is an
+ * alias of (virtualsinkaliases[]), else -1 - not a stream the policy routes.
+ * The class is the index into sink_mapping_table, whose names are those of
+ * virtualsinkmap[] and never change. */
+static int virtual_sink_class(const char *name)
+{
+    int i;
+
+    if (!name)
+        return -1;
+    for (i = eVirtualSink_First; i < eVirtualSink_Count; i++)
+        if (pa_streq(name, virtualsinkmap[i].virtualsinkname))
+            return i;
+    for (i = 0; virtualsinkaliases[i].virtualsinkname; i++)
+        if (pa_streq(name, virtualsinkaliases[i].virtualsinkname))
+            return (int)virtualsinkaliases[i].routedas;
+    return -1;
+}
+
 /* callback for stream creation */
 static pa_hook_result_t route_sink_input_new_hook_callback(pa_core *c, pa_sink_input_new_data *data,
                                                            struct userdata *u)
@@ -3504,20 +3524,14 @@ static pa_hook_result_t route_sink_input_new_hook_callback(pa_core *c, pa_sink_i
         pa_log_debug("new stream is opened with sink name : %s", data->sink->name);
         pa_proplist_sets(type, "media.type", data->sink->name);
         pa_proplist_update(data->proplist, PA_UPDATE_MERGE, type);
-        for (i = eVirtualSink_First; i < eVirtualSink_Count; i++)
+        i = virtual_sink_class(data->sink->name);
+        if (i >= 0)
         {
-            if (pa_streq(data->sink->name, u->sink_mapping_table[i].virtualsinkname))
-            {
-                pa_log_debug("found virtual sink index on virtual sink %d, name %s, index %d",
-                             virtualsinkmap[i].virtualsinkidentifier, data->sink->name, i);
-                u->media_type = i;
-                break;
-            }
-        }
-
-        if (i < eVirtualSink_Count)
-        {
-            /* opened on a virtual sink: route it to where that sink goes */
+            /* opened on a virtual sink, or on a phone-era one that goes where
+             * the class it is an alias of goes: route it there */
+            pa_log_debug("stream on virtual sink %s is routed as %s (index %d)",
+                         data->sink->name, u->sink_mapping_table[i].virtualsinkname, i);
+            u->media_type = i;
             sink = pa_namereg_get(c, u->sink_mapping_table[i].outputdevice, PA_NAMEREG_SINK);
             pa_log_info("routing to device:%s", u->sink_mapping_table[i].outputdevice);
             if (sink)
@@ -3538,7 +3552,7 @@ static pa_hook_result_t route_sink_input_fixate_hook_callback(pa_core *c, pa_sin
                                                               struct userdata *u)
 {
 
-    int i, sink_index = -1, volumetoset, volumetable;
+    int sink_index, volumetoset, volumetable;
     int ismute;
     const char *type;
     struct pa_cvolume cvolume;
@@ -3549,14 +3563,8 @@ static pa_hook_result_t route_sink_input_fixate_hook_callback(pa_core *c, pa_sin
 
     type = pa_proplist_gets(data->proplist, "media.type");
 
-    for (i = 0; i < eVirtualSink_Count; i++)
-    {
-        if (pa_safe_streq(type, u->sink_mapping_table[i].virtualsinkname))
-        {
-            sink_index = i;
-            break;
-        }
-    }
+    /* a phone-era stream takes the volume of the class it is routed as */
+    sink_index = virtual_sink_class(type);
     if (sink_index == -1)
     {
         /* not a stream type we route: leave its volume and mute alone */
@@ -3625,14 +3633,11 @@ static pa_hook_result_t route_sink_input_put_hook_callback(pa_core *c, pa_sink_i
     pa_log("Sink opened with application name:%s, sink input index:%d",
            si_data->appname, si_data->sinkinputidx);
     si_type = pa_proplist_gets(data->proplist, "media.type");
-    for (i = 0; i < eVirtualSink_Count; i++)
-    {
-        if (pa_safe_streq(si_type, u->sink_mapping_table[i].virtualsinkname))
-        {
-            si_data->virtualsinkid = u->sink_mapping_table[i].virtualsinkidentifier;
-            break;
-        }
-    }
+    /* a phone-era stream is tracked, moved and reported to audiod as the
+     * class it is routed as; its media.type keeps its own name */
+    i = virtual_sink_class(si_type);
+    if (i >= 0)
+        si_data->virtualsinkid = (int32_t)u->sink_mapping_table[i].virtualsinkidentifier;
     if (si_data->virtualsinkid == -1)
     {
         /* not a stream type we route: nothing to track */
