@@ -52,24 +52,45 @@ PULSE_PROP='application.name=t3 test.stream=t3' timeout 3 "${PC[@]}" --playback 
 PULSE_PROP='media.role=phone application.name=t4' timeout 3 "${PC[@]}" --playback /dev/zero & STREAMS+=($!)
 PULSE_PROP='media.type=record application.name=r1' timeout 3 "${PC[@]}" --record > /dev/null & STREAMS+=($!)
 PULSE_PROP='media.type=nonsense application.name=r2' timeout 3 "${PC[@]}" --record -d record > /dev/null & STREAMS+=($!)
+PULSE_PROP='application.name=t5 test.stream=t5' timeout 3 "${PC[@]}" --playback -d palarm /dev/zero & STREAMS+=($!)
+PULSE_PROP='application.name=t6 test.stream=t6' timeout 3 "${PC[@]}" --playback -d pcalendar /dev/zero & STREAMS+=($!)
 # t3 names the default sink, as QtMultimedia does: it must be routed like t2,
 # which names none - on pdefaultapp, with no preferred device of its own -
 # or it is never moved off the loudspeaker.
+# t5 and t6 open phone-era sinks that have no class of their own: they must
+# leave the null sink for where the class they are an alias of goes (with no
+# audiod, the class's own virtual sink) and keep their name as media.type.
 sleep 1
 "$LD" --library-path "$LP" "$ROOTFS/usr/bin/pactl" list sink-inputs > "$T/sink-inputs.txt" 2>&1
-for app in t2 t3; do
+"$LD" --library-path "$LP" "$ROOTFS/usr/bin/pactl" list short sinks > "$T/sinks.txt" 2>&1
+stream_props() {
     # pacat puts its own application.name over PULSE_PROP's
-    props=$(awk -v app="test.stream = \"$app\"" '
+    awk -v app="test.stream = \"$1\"" '
         function flush() { if (hit) print block }
         /^Sink Input #/ { flush(); block = ""; hit = 0 }
         { block = block "\n" $0; if (index($0, app)) hit = 1 }
-        END { flush() }' "$T/sink-inputs.txt")
+        END { flush() }' "$T/sink-inputs.txt"
+}
+for app in t2 t3; do
+    props=$(stream_props $app)
     type=$(echo "$props" | sed -n 's/.*media.type = "\(.*\)"/\1/p' | head -n 1)
     pref=$(echo "$props" | grep -c "preferred.device")
     if [ "$type" = pdefaultapp ] && [ "$pref" = 0 ]; then
         echo "### routing $app: ok (media.type $type)"
     else
         echo "### routing $app: FAIL (media.type '$type', preferred.device $pref)"
+    fi
+done
+for want in "t5 palarm pringtones" "t6 pcalendar palerts"; do
+    set -- $want
+    props=$(stream_props $1)
+    type=$(echo "$props" | sed -n 's/.*media.type = "\(.*\)"/\1/p' | head -n 1)
+    idx=$(echo "$props" | sed -n 's/^[[:space:]]*Sink: \([0-9]*\)$/\1/p' | head -n 1)
+    sink=$(awk -v i="$idx" '$1 == i { print $2 }' "$T/sinks.txt")
+    if [ "$type" = "$2" ] && [ "$sink" = "$3" ]; then
+        echo "### routing $1: ok ($2 routed to $sink)"
+    else
+        echo "### routing $1: FAIL (media.type '$type' on sink '$sink', wanted $2 on $3)"
     fi
 done
 python3 "$HERE/client.py" 7 "$FUZZ"; echo "### client rc=$?"
