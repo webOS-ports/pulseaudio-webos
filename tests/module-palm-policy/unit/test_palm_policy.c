@@ -520,6 +520,114 @@ TEST(SinkClass, aPhoneEraStreamIsTrackedAsItsClass)
     fixture_down(&f);
 }
 
+/* module-combine-sink feeds each of its slaves through a stream of its own,
+ * with the media role "filter" - LuneOS's speaker-and-USB ring sink combines
+ * pcm_output, the default sink, and the USB headset. The new-stream hook took
+ * the one on pcm_output for an application's stream on the default sink and
+ * moved it to pdefaultapp, and tagged the one on the headset pdefaultapp. */
+static void filter_stream_data(pa_sink_input_new_data *d, pa_sink *sink, const char *role)
+{
+    pa_sink_input_new_data_init(d);
+    if (role)
+        pa_proplist_sets(d->proplist, PA_PROP_MEDIA_ROLE, role);
+    pa_proplist_sets(d->proplist, PA_PROP_MEDIA_NAME, "Simultaneous output on the speaker");
+    d->sink = sink;
+}
+
+TEST(FilterStream, aCombinedSinksStreamOnTheDefaultSinkIsLeftThere)
+{
+    struct fixture f;
+    pa_sink_input_new_data d;
+    pa_sink pcm;
+
+    fixture_up(&f);
+    memset(&pcm, 0, sizeof(pcm));
+    pcm.name = (char *)"pcm_output";
+    pcm.driver = (char *)"module-remap-sink.c";
+    f.core->default_sink = &pcm;
+
+    filter_stream_data(&d, &pcm, "filter");
+    route_sink_input_new_hook_callback(f.core, &d, f.u);
+    CHECK(d.sink == &pcm);
+    CHECK(pa_proplist_gets(d.proplist, "media.type") == NULL);
+    CHECK(pa_proplist_gets(d.proplist, PA_PROP_PREFERRED_DEVICE) == NULL);
+    pa_sink_input_new_data_done(&d);
+
+    /* an application's stream on the default sink is still routed: it is
+     * tagged as the default application's */
+    filter_stream_data(&d, &pcm, "music");
+    route_sink_input_new_hook_callback(f.core, &d, f.u);
+    CHECK(pa_safe_streq(pa_proplist_gets(d.proplist, "media.type"), "pdefaultapp"));
+    pa_sink_input_new_data_done(&d);
+
+    f.core->default_sink = NULL;
+    fixture_down(&f);
+}
+
+TEST(FilterStream, aCombinedSinksStreamOnAnotherSinkIsNotTagged)
+{
+    struct fixture f;
+    pa_sink_input_new_data d;
+    pa_sink usb;
+
+    fixture_up(&f);
+    memset(&usb, 0, sizeof(usb));
+    usb.name = (char *)"usb_speaker0";
+    usb.driver = (char *)"module-alsa-sink.c";
+
+    filter_stream_data(&d, &usb, "filter");
+    route_sink_input_new_hook_callback(f.core, &d, f.u);
+    CHECK(d.sink == &usb);
+    CHECK(pa_proplist_gets(d.proplist, "media.type") == NULL);
+    CHECK(pa_proplist_gets(d.proplist, PA_PROP_PREFERRED_DEVICE) == NULL);
+    pa_sink_input_new_data_done(&d);
+
+    /* without the role it is what it always was: a stream that chose a real
+     * sink, tagged pdefaultapp and pinned there */
+    filter_stream_data(&d, &usb, NULL);
+    route_sink_input_new_hook_callback(f.core, &d, f.u);
+    CHECK(pa_safe_streq(pa_proplist_gets(d.proplist, "media.type"), "pdefaultapp"));
+    CHECK(pa_safe_streq(pa_proplist_gets(d.proplist, PA_PROP_PREFERRED_DEVICE), "usb_speaker0"));
+    pa_sink_input_new_data_done(&d);
+
+    fixture_down(&f);
+}
+
+/* Left untagged, the fixate hook gives it no class volume and the put hook
+ * neither tracks it nor tells audiod of it. */
+TEST(FilterStream, anUntaggedFilterStreamGetsNoVolumeAndIsNotTracked)
+{
+    struct fixture f;
+    pa_sink_input_new_data d;
+    pa_sink usb;
+    pa_sink_input si;
+
+    fixture_up(&f);
+    memset(&usb, 0, sizeof(usb));
+    usb.name = (char *)"usb_speaker0";
+    usb.driver = (char *)"module-alsa-sink.c";
+    f.u->sink_mapping_table[edefaultapp].volume = 10;
+
+    filter_stream_data(&d, &usb, "filter");
+    pa_channel_map_init_stereo(&d.channel_map);
+    d.volume_writable = true;
+    route_sink_input_new_hook_callback(f.core, &d, f.u);
+    route_sink_input_fixate_hook_callback(f.core, &d, f.u);
+    CHECK(!d.volume_is_set);
+    CHECK(!d.muted_is_set);
+
+    memset(&si, 0, sizeof(si));
+    si.proplist = d.proplist;
+    si.index = 7;
+    si.state = PA_SINK_INPUT_RUNNING;
+    route_sink_input_put_hook_callback(f.core, &si, f.u);
+    CHECK_EQ(f.u->n_sink_input_opened, 0);
+    CHECK(f.u->sinkinputnodelist == NULL);
+    pa_sink_input_new_data_done(&d);
+
+    fixture_down(&f);
+}
+
 /* The sink module-bluez5-device makes for a headset, which the policy looks
  * up to tell audiod of a headset already there (audiod restarted, or missed
  * it while bluetooth2 was away). */

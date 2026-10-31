@@ -3383,6 +3383,21 @@ static bool stream_chose_its_sink(const pa_sink *requested, const pa_sink *defau
     return requested != NULL && requested != default_sink;
 }
 
+/* Whether a new stream is one PulseAudio's own filter modules open to feed
+ * the sink they filter or combine: module-combine-sink's stream to each of its
+ * slaves, module-remap-sink's to its master, and the like. They all carry the
+ * media role "filter". Such a stream is plumbing, not something an application
+ * plays: it has to stay on the sink its module put it on, at the volume that
+ * module set. Treated as a stream of its own, the stream module-combine-sink
+ * opens on pcm_output - the default sink - was taken for an application's
+ * and moved to pdefaultapp, so a combined sink never played on pcm_output, and
+ * its stream to any other sink was tagged pdefaultapp, given the media volume
+ * and reported to audiod as media playing. */
+static bool stream_feeds_a_filter(const pa_proplist *p)
+{
+    return pa_safe_streq(pa_proplist_gets(p, PA_PROP_MEDIA_ROLE), "filter");
+}
+
 /* The routed class of a stream opened on, or tagged with, the sink called
  * @name: the virtual sink of that name, else the one a phone-era sink is an
  * alias of (virtualsinkaliases[]), else -1 - not a stream the policy routes.
@@ -3415,6 +3430,13 @@ static pa_hook_result_t route_sink_input_new_hook_callback(pa_core *c, pa_sink_i
     pa_assert(u);
     pa_assert(c);
     pa_log("route_sink_input_new_hook_callback");
+
+    if (stream_feeds_a_filter(data->proplist))
+    {
+        /* untagged, so the fixate and put hooks leave it alone as well */
+        pa_log_debug("stream of a filter module, left on %s", data->sink ? data->sink->name : "(no sink)");
+        return PA_HOOK_OK;
+    }
 
     type = pa_proplist_new();
 
