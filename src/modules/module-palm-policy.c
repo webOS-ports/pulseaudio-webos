@@ -2355,7 +2355,7 @@ static void send_callback_to_audiod(int id, int returnVal, struct userdata *u)
     if (!send_to_audiod(u, PAUDIOD_REPLY_MSGTYPE_CALLBACK, 0, &vSink, sizeof(vSink)))
         pa_log("Failed to send message to audiod from pulseaudio");
     else
-        pa_log("message sent to audiod from pulseaudio");
+        pa_log_debug("message sent to audiod from pulseaudio");
 }
 
 /* Parse a message sent from audiod and invoke
@@ -3429,7 +3429,7 @@ static pa_hook_result_t route_sink_input_new_hook_callback(pa_core *c, pa_sink_i
     pa_assert(data);
     pa_assert(u);
     pa_assert(c);
-    pa_log("route_sink_input_new_hook_callback");
+    pa_log_debug("route_sink_input_new_hook_callback");
 
     if (stream_feeds_a_filter(data->proplist))
     {
@@ -3648,11 +3648,11 @@ static pa_hook_result_t route_sink_input_put_hook_callback(pa_core *c, pa_sink_i
     }
     else
     {
-        pa_log("BYPASS disabled");
+        pa_log_debug("BYPASS disabled");
         si_data->bypassRouting = false;
     }
 
-    pa_log("Sink opened with application name:%s, sink input index:%d",
+    pa_log_info("Sink opened with application name:%s, sink input index:%d",
            si_data->appname, si_data->sinkinputidx);
     si_type = pa_proplist_gets(data->proplist, "media.type");
     /* a phone-era stream is tracked, moved and reported to audiod as the
@@ -3702,7 +3702,7 @@ static pa_hook_result_t route_sink_input_put_hook_callback(pa_core *c, pa_sink_i
         if (-1 == ret)
             pa_log("send() failed: %s", strerror(errno));
         else
-            pa_log("sent playback stream open message to audiod");
+            pa_log_debug("sent playback stream open message to audiod");
     }
 
     if (u->preprocess_module && si_data->virtualsinkid == u->PreprocessSinkId)
@@ -3946,7 +3946,7 @@ static pa_hook_result_t route_source_output_put_hook_callback(pa_core *c, pa_sou
     {
         copy_field(node->appname, sizeof(node->appname), pa_proplist_gets(so->proplist, PA_PROP_APPLICATION_NAME));
     }
-    pa_log("Source opened with application name:%s, source output index:%d",
+    pa_log_info("Source opened with application name:%s, source output index:%d",
            node->appname, node->sourceoutputidx);
 
     node->paused = false;
@@ -4059,7 +4059,7 @@ static pa_hook_result_t route_sink_input_unlink_hook_callback(pa_core *c, pa_sin
                 if (u->connectionactive && u->connev != NULL)
                 {
 
-                    pa_log("Sink closed with application name:%s, sink input index:%d",
+                    pa_log_info("Sink closed with application name:%s, sink input index:%d",
                            thelistitem->appname, thelistitem->sinkinputidx);
 
                     struct paReplyToPolicySet policySet;
